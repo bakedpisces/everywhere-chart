@@ -1,0 +1,15 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "echo 'No default process — use cron services'"
+
+[[services]]
+name = "reddit-collector"
+cronSchedule = "0 1,7,13,19 * * *"
+startCommand = "python -m collectors.reddit_collector"
+
+[[services]]
+name = "press-collector"
+cronSchedule = "0 2,14 * * *"
+startCommand = "python -m collectors.press_collector"
