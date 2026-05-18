@@ -97,28 +97,40 @@ def fetch_trending_sounds(region: dict) -> list[dict]:
             page.wait_for_timeout(6_000)
 
             if "req_headers" in captured:
-                # Replay with the page's own auth headers but limit=50
-                params = (
-                    "rank_type=popular&period=7&page=1&limit=50"
-                    "&new_on_board=false&commercial_music=false"
-                )
-                if region["country_code"]:
-                    params += f"&country_code={region['country_code']}"
+                # Paginate with limit=20 (API max appears to be ~20)
+                all_items = []
+                for page_num in range(1, 4):  # up to 3 pages = ~60 tracks
+                    params = (
+                        f"rank_type=popular&period=7&page={page_num}&limit=20"
+                        f"&new_on_board=false&commercial_music=false"
+                    )
+                    if region["country_code"]:
+                        params += f"&country_code={region['country_code']}"
 
-                resp = page.request.get(
-                    f"{API_LIST_URL}?{params}",
-                    headers=captured["req_headers"],
-                    timeout=20_000,
-                )
-                log.info(f"rank_list replay status={resp.status} for {region['label']}")
-                if resp.status == 200:
+                    resp = page.request.get(
+                        f"{API_LIST_URL}?{params}",
+                        headers=captured["req_headers"],
+                        timeout=20_000,
+                    )
+                    log.info(f"rank_list page={page_num} status={resp.status} for {region['label']}")
+                    if resp.status != 200:
+                        break
                     body = resp.json()
-                    if body.get("data"):
-                        captured["data"] = body
-                    else:
-                        log.warning(f"replay: code={body.get('code')} msg={body.get('msg')}")
-                        if "page_data" in captured:
-                            captured["data"] = captured["page_data"]
+                    if not body.get("data"):
+                        log.warning(f"page={page_num} code={body.get('code')} msg={body.get('msg')}")
+                        break
+                    items = body["data"].get("sound_list") or []
+                    if not items:
+                        break
+                    all_items.extend(items)
+                    log.info(f"  → {len(items)} tracks (total so far: {len(all_items)})")
+                    time.sleep(1)
+
+                if all_items:
+                    captured["data"] = {"data": {"sound_list": all_items}}
+                elif "page_data" in captured:
+                    log.info(f"Falling back to intercepted page data for {region['label']}")
+                    captured["data"] = captured["page_data"]
             elif "page_data" in captured:
                 log.info(f"Using page's intercepted rank_list data for {region['label']}")
                 captured["data"] = captured["page_data"]
