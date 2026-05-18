@@ -46,19 +46,12 @@ INTENTIONALITY_TIKTOK = 0.80
 
 def fetch_trending_sounds(region: dict) -> list[dict]:
     """
-    Load Creative Center to acquire session cookies, then directly call
-    the list API endpoint using the authenticated page.request context.
+    Load Creative Center, interact with the page to trigger the sound list
+    API call, intercept the response, and return normalized track rows.
     """
     from playwright.sync_api import sync_playwright
 
-    params = {
-        "rank_type": "popular",
-        "period":    7,
-        "page":      1,
-        "limit":     50,
-    }
-    if region["country_code"]:
-        params["country_code"] = region["country_code"]
+    captured = {}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -71,36 +64,78 @@ def fetch_trending_sounds(region: dict) -> list[dict]:
         )
         page = context.new_page()
 
+        def on_response(response):
+            url = response.url
+            # Log everything from ads.tiktok for debugging
+            if "ads.tiktok.com/creative_radar_api" in url:
+                log.info(f"[net] {response.status} {url[:150]}")
+            # Capture any sound list/ranking endpoint
+            if "ads.tiktok.com" not in url:
+                return
+            if not any(k in url for k in ["sound", "music", "trend"]):
+                return
+            if any(k in url for k in ["filter", "user", "location", "config", "info"]):
+                return
+            if response.status == 200 and "data" not in captured:
+                try:
+                    body = response.json()
+                    # Only keep if it looks like a list payload
+                    if isinstance(body.get("data"), dict) and (
+                        "music_list" in body["data"]
+                        or "sound_list" in body["data"]
+                        or "list" in body["data"]
+                    ):
+                        captured["data"] = body
+                        captured["url"]  = url
+                        log.info(f"Captured list response from {url[:120]}")
+                except Exception:
+                    pass
+
+        page.on("response", on_response)
+
         try:
-            # Load the page first to acquire session cookies/tokens
-            page.goto(CREATIVE_CENTER_URL, wait_until="networkidle", timeout=60_000)
+            url = CREATIVE_CENTER_URL
+            if region["country_code"]:
+                url += f"?country_code={region['country_code']}"
+            page.goto(url, wait_until="networkidle", timeout=60_000)
+            page.wait_for_timeout(3_000)
+
+            # Scroll down to trigger lazy-loaded list
+            page.mouse.wheel(0, 600)
+            page.wait_for_timeout(3_000)
+            page.mouse.wheel(0, 600)
+            page.wait_for_timeout(3_000)
+
+            # Try clicking any tab/button that might trigger the sound list
+            for selector in [
+                "text=Popular",
+                "text=Trending",
+                "[data-testid*='sound']",
+                "[class*='music']",
+                "[class*='sound']",
+            ]:
+                try:
+                    el = page.locator(selector).first
+                    if el.is_visible(timeout=1_000):
+                        el.click()
+                        page.wait_for_timeout(3_000)
+                        break
+                except Exception:
+                    pass
+
             page.wait_for_timeout(4_000)
 
-            # Call the list API directly — inherits all cookies set by the page
-            resp = page.request.get(
-                API_LIST_URL,
-                params=params,
-                headers={
-                    "Referer":  CREATIVE_CENTER_URL,
-                    "Accept":   "application/json, text/plain, */*",
-                },
-                timeout=20_000,
-            )
-
-            if resp.status != 200:
-                log.warning(f"TikTok list API returned {resp.status} for {region['label']}")
-                return []
-
-            data = resp.json()
-            log.info(f"TikTok list API responded for {region['label']} — top keys: {list(data.keys())}")
-            return _parse_response(data, region)
-
         except Exception as e:
-            log.warning(f"TikTok fetch failed for {region['label']}: {e}")
-            return []
+            log.warning(f"Page interaction failed for TikTok {region['label']}: {e}")
         finally:
             context.close()
             browser.close()
+
+    if not captured:
+        log.warning(f"No list API response captured for TikTok {region['label']}")
+        return []
+
+    return _parse_response(captured["data"], region)
 
 
 def _parse_response(data: dict, region: dict) -> list[dict]:
