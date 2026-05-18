@@ -66,6 +66,9 @@ def fetch_trending_sounds(region: dict) -> list[dict]:
         page = context.new_page()
 
         def on_response(response):
+            # Log all JSON-ish responses from tiktok/ads domains for debugging
+            if any(h in response.url for h in ["tiktok.com", "ads.tiktok"]):
+                log.info(f"[net] {response.status} {response.url[:120]}")
             if API_HOST not in response.url:
                 return
             if API_PATH not in response.url:
@@ -88,7 +91,7 @@ def fetch_trending_sounds(region: dict) -> list[dict]:
                 url += f"?country_code={region['country_code']}"
             page.goto(url, wait_until="networkidle", timeout=60_000)
             # Give JS time to fire the API call if networkidle fired early
-            page.wait_for_timeout(3_000)
+            page.wait_for_timeout(8_000)
         except Exception as e:
             log.warning(f"Page load failed for TikTok {region['label']}: {e}")
         finally:
