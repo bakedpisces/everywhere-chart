@@ -32,7 +32,7 @@ DB_URL = os.environ["DATABASE_URL"]
 CREATIVE_CENTER_URL = (
     "https://ads.tiktok.com/business/creativecenter/inspiration/popular/music/pc/en"
 )
-API_LIST_URL = "https://ads.tiktok.com/creative_radar_api/v1/popular_trend/sound/list"
+API_LIST_URL = "https://ads.tiktok.com/creative_radar_api/v1/popular_trend/sound/rank_list"
 
 REGIONS = [
     {"country_code": "",   "label": "global"},
@@ -64,69 +64,42 @@ def fetch_trending_sounds(region: dict) -> list[dict]:
         )
         page = context.new_page()
 
-        def on_response(response):
-            url = response.url
-            # Log everything from ads.tiktok for debugging
-            if "ads.tiktok.com/creative_radar_api" in url:
-                log.info(f"[net] {response.status} {url[:150]}")
-            # Capture any sound list/ranking endpoint
-            if "ads.tiktok.com" not in url:
-                return
-            if not any(k in url for k in ["sound", "music", "trend"]):
-                return
-            if any(k in url for k in ["filter", "user", "location", "config", "info"]):
-                return
-            if response.status == 200 and "data" not in captured:
-                try:
-                    body = response.json()
-                    # Only keep if it looks like a list payload
-                    if isinstance(body.get("data"), dict) and (
-                        "music_list" in body["data"]
-                        or "sound_list" in body["data"]
-                        or "list" in body["data"]
-                    ):
-                        captured["data"] = body
-                        captured["url"]  = url
-                        log.info(f"Captured list response from {url[:120]}")
-                except Exception:
-                    pass
-
-        page.on("response", on_response)
 
         try:
             url = CREATIVE_CENTER_URL
             if region["country_code"]:
                 url += f"?country_code={region['country_code']}"
             page.goto(url, wait_until="networkidle", timeout=60_000)
-            page.wait_for_timeout(3_000)
-
-            # Scroll down to trigger lazy-loaded list
-            page.mouse.wheel(0, 600)
-            page.wait_for_timeout(3_000)
-            page.mouse.wheel(0, 600)
-            page.wait_for_timeout(3_000)
-
-            # Try clicking any tab/button that might trigger the sound list
-            for selector in [
-                "text=Popular",
-                "text=Trending",
-                "[data-testid*='sound']",
-                "[class*='music']",
-                "[class*='sound']",
-            ]:
-                try:
-                    el = page.locator(selector).first
-                    if el.is_visible(timeout=1_000):
-                        el.click()
-                        page.wait_for_timeout(3_000)
-                        break
-                except Exception:
-                    pass
-
             page.wait_for_timeout(4_000)
 
+            # Scroll to warm up the session (triggers rank_list internally)
+            page.mouse.wheel(0, 800)
+            page.wait_for_timeout(4_000)
+
+            # Call rank_list directly via page.request — inherits all session cookies/tokens
+            params = (
+                f"rank_type=popular&period=7&page=1&limit=50"
+                f"&new_on_board=false&commercial_music=false"
+            )
+            if region["country_code"]:
+                params += f"&country_code={region['country_code']}"
+
+            resp = page.request.get(
+                f"{API_LIST_URL}?{params}",
+                headers={
+                    "Referer": CREATIVE_CENTER_URL,
+                    "Accept":  "application/json, text/plain, */*",
+                },
+                timeout=20_000,
+            )
+            log.info(f"rank_list status={resp.status} for {region['label']}")
+            if resp.status == 200:
+                captured["data"] = resp.json()
+            else:
+                log.warning(f"rank_list returned {resp.status} for {region['label']}")
+
         except Exception as e:
-            log.warning(f"Page interaction failed for TikTok {region['label']}: {e}")
+            log.warning(f"Page evaluation failed for TikTok {region['label']}: {e}")
         finally:
             context.close()
             browser.close()
@@ -139,17 +112,23 @@ def fetch_trending_sounds(region: dict) -> list[dict]:
 
 
 def _parse_response(data: dict, region: dict) -> list[dict]:
-    """Extract track rows from the Creative Center API JSON."""
-    try:
-        items = data["data"]["music_list"]
-    except (KeyError, TypeError):
-        log.warning(f"Unexpected TikTok API shape for {region['label']}: {list(data.keys())}")
+    """Extract track rows from the Creative Center rank_list API JSON."""
+    inner = data.get("data", {})
+    # rank_list endpoint uses "list"; older endpoints used "music_list"
+    items = (
+        inner.get("list")
+        or inner.get("music_list")
+        or inner.get("sound_list")
+        or []
+    )
+    if not items:
+        log.warning(f"TikTok API shape for {region['label']}: data keys={list(inner.keys())}")
         return []
 
     rows = []
     for i, item in enumerate(items, start=1):
-        title  = (item.get("music_name") or item.get("title") or "").strip()
-        artist = (item.get("author")     or item.get("artist_name") or "").strip()
+        title  = (item.get("music_name") or item.get("title") or item.get("name") or "").strip()
+        artist = (item.get("author") or item.get("artist_name") or item.get("artist") or "").strip()
         if not title or not artist:
             continue
 
@@ -157,10 +136,10 @@ def _parse_response(data: dict, region: dict) -> list[dict]:
             item.get("item_count")
             or item.get("use_count")
             or item.get("video_count")
+            or item.get("rank_value")
             or 0
         )
         tiktok_id = str(item.get("music_id") or item.get("id") or "")
-        cover_url = item.get("cover") or item.get("cover_url") or ""
 
         rows.append({
             "rank":        i,
@@ -168,7 +147,6 @@ def _parse_response(data: dict, region: dict) -> list[dict]:
             "artist":      artist,
             "tiktok_id":   tiktok_id,
             "usage_count": int(usage_count),
-            "cover_url":   cover_url,
             "region":      region["label"],
         })
 
