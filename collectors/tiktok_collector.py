@@ -46,14 +46,45 @@ INTENTIONALITY_TIKTOK = 0.80
 
 # ── Chart fetch ───────────────────────────────────────────────────────────────
 
-def fetch_sound_uses(region: dict) -> list[dict]:
+def _fetch_region(page_request, auth_headers: dict, region: dict) -> list[dict]:
+    """Fetch up to 3 pages of rank_list for one region using pre-captured auth headers."""
+    all_items = []
+    for page_num in range(1, 4):
+        params = f"rank_type=popular&period=7&page={page_num}&limit=20&new_on_board=false&country_code={region['country_code']}"
+        try:
+            resp = page_request.get(
+                f"{API_LIST_URL}?{params}",
+                headers=auth_headers,
+                timeout=20_000,
+            )
+        except Exception as e:
+            log.warning(f"rank_list request failed p={page_num} {region['label']}: {e}")
+            break
+        if resp.status != 200:
+            log.warning(f"rank_list p={page_num} status={resp.status} for {region['label']}")
+            break
+        body = resp.json()
+        if not body.get("data"):
+            log.warning(f"rank_list p={page_num} code={body.get('code')} msg={body.get('msg')}")
+            break
+        items = body["data"].get("sound_list") or []
+        if not items:
+            break
+        all_items.extend(items)
+        log.info(f"  {region['label']} p={page_num}: {len(items)} tracks (total {len(all_items)})")
+        time.sleep(1)
+    return all_items
+
+
+def fetch_all_regions() -> dict[str, list[dict]]:
     """
-    Load Creative Center, interact with the page to trigger the sound list
-    API call, intercept the response, and return normalized track rows.
+    Launch ONE browser, load AU page to reliably capture auth headers,
+    then call rank_list for every region using those headers.
+    Returns {region_label: [rows]}.
     """
     from playwright.sync_api import sync_playwright
 
-    captured = {}
+    auth_headers = {}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -64,134 +95,74 @@ def fetch_sound_uses(region: dict) -> list[dict]:
                 "Chrome/124.0.0.0 Safari/537.36"
             )
         )
-        page = context.new_page()
-
+        pg = context.new_page()
 
         def on_request(request):
-            """Capture auth headers from the page's own rank_list call."""
             if "rank_list" in request.url and "ads.tiktok.com" in request.url:
-                captured["req_headers"] = dict(request.headers)
-                log.info(f"Captured rank_list request headers for {region['label']}")
+                auth_headers.update(dict(request.headers))
+                log.info("Captured rank_list auth headers")
 
-        def on_response(response):
-            """Capture the page's own rank_list response as fallback."""
-            if "rank_list" in response.url and "ads.tiktok.com" in response.url and response.status == 200:
-                try:
-                    body = response.json()
-                    if body.get("data"):
-                        captured["page_data"] = body
-                        log.info(f"Captured page rank_list response for {region['label']}")
-                except Exception:
-                    pass
-
-        page.on("request",  on_request)
-        page.on("response", on_response)
+        pg.on("request", on_request)
 
         try:
-            page_url = CREATIVE_CENTER_URL
-            if region["country_code"]:
-                page_url += f"?country_code={region['country_code']}"
-            page.goto(page_url, wait_until="networkidle", timeout=60_000)
-            page.wait_for_timeout(4_000)
+            # AU reliably triggers rank_list — use it to warm the session
+            pg.goto(f"{CREATIVE_CENTER_URL}?country_code=AU",
+                    wait_until="networkidle", timeout=60_000)
+            pg.wait_for_timeout(4_000)
+            pg.mouse.wheel(0, 800)
+            pg.wait_for_timeout(5_000)
 
-            # Scroll to trigger the rank_list call from the page's own JS
-            page.mouse.wheel(0, 800)
-            page.wait_for_timeout(6_000)
+            if not auth_headers:
+                log.warning("rank_list never fired on AU page — no auth headers")
+                return {}
 
-            if "req_headers" in captured:
-                # Paginate with limit=20 (API max appears to be ~20)
-                all_items = []
-                for page_num in range(1, 4):  # up to 3 pages = ~60 tracks
-                    params = f"rank_type=popular&period=7&page={page_num}&limit=20&new_on_board=false"
-                    if region["country_code"]:
-                        params += f"&country_code={region['country_code']}"
+            log.info(f"Auth headers captured — fetching {len(REGIONS)} regions")
+            results = {}
+            for region in REGIONS:
+                items = _fetch_region(pg.request, auth_headers, region)
+                if items:
+                    results[region["label"]] = [
+                        {"rank": i + 1, **item, "region": region["label"]}
+                        for i, item in enumerate(items)
+                    ]
+                    log.info(f"  {region['label']}: {len(items)} total tracks")
+                else:
+                    log.warning(f"  {region['label']}: no tracks returned")
+                time.sleep(2)
 
-                    resp = page.request.get(
-                        f"{API_LIST_URL}?{params}",
-                        headers=captured["req_headers"],
-                        timeout=20_000,
-                    )
-                    log.info(f"rank_list page={page_num} status={resp.status} for {region['label']}")
-                    if resp.status != 200:
-                        break
-                    body = resp.json()
-                    if not body.get("data"):
-                        log.warning(f"page={page_num} code={body.get('code')} msg={body.get('msg')}")
-                        break
-                    items = body["data"].get("sound_list") or []
-                    if not items:
-                        break
-                    all_items.extend(items)
-                    log.info(f"  → {len(items)} tracks (total so far: {len(all_items)})")
-                    time.sleep(1)
-
-                if all_items:
-                    captured["data"] = {"data": {"sound_list": all_items}}
-                elif "page_data" in captured:
-                    log.info(f"Falling back to intercepted page data for {region['label']}")
-                    captured["data"] = captured["page_data"]
-            elif "page_data" in captured:
-                log.info(f"Using page's intercepted rank_list data for {region['label']}")
-                captured["data"] = captured["page_data"]
+            return results
 
         except Exception as e:
-            log.warning(f"TikTok fetch failed for {region['label']}: {e}")
+            log.warning(f"TikTok browser session failed: {e}")
+            return {}
         finally:
             context.close()
             browser.close()
 
-    if "data" not in captured:
-        log.warning(f"No data captured for TikTok {region['label']}")
-        return []
 
-    return _parse_response(captured["data"], region)
-
-
-def _parse_response(data: dict, region: dict) -> list[dict]:
-    """Extract track rows from the Creative Center rank_list API JSON."""
-    log.info(f"TikTok response top-level keys for {region['label']}: {list(data.keys())}")
-    inner = data.get("data", {})
-    if isinstance(inner, dict):
-        log.info(f"TikTok data keys: {list(inner.keys())}")
-    else:
-        log.info(f"TikTok data type: {type(inner).__name__}, value[:200]: {str(inner)[:200]}")
-    # rank_list endpoint uses "list"; older endpoints used "music_list"
-    items = (
-        inner.get("list")
-        or inner.get("music_list")
-        or inner.get("sound_list")
-        or []
-    ) if isinstance(inner, dict) else (inner if isinstance(inner, list) else [])
-    if not items:
-        log.warning(f"No items found in TikTok response for {region['label']}")
-        return []
-
+def _parse_items(raw_items: list, region_label: str) -> list[dict]:
+    """Normalise raw sound_list items into track row dicts."""
     rows = []
-    for i, item in enumerate(items, start=1):
+    for i, item in enumerate(raw_items, start=1):
         title  = (item.get("music_name") or item.get("title") or item.get("name") or "").strip()
         artist = (item.get("author") or item.get("artist_name") or item.get("artist") or "").strip()
         if not title or not artist:
             continue
-
-        usage_count = (
+        usage_count = int(
             item.get("item_count")
             or item.get("use_count")
             or item.get("video_count")
             or item.get("rank_value")
             or 0
         )
-        tiktok_id = str(item.get("music_id") or item.get("id") or "")
-
         rows.append({
-            "rank":        i,
+            "rank":        item.get("rank", i),
             "title":       title,
             "artist":      artist,
-            "tiktok_id":   tiktok_id,
-            "usage_count": int(usage_count),
-            "region":      region["label"],
+            "tiktok_id":   str(item.get("music_id") or item.get("id") or ""),
+            "usage_count": usage_count,
+            "region":      region_label,
         })
-
-    log.info(f"Parsed {len(rows)} tracks from TikTok {region['label']}")
     return rows
 
 
@@ -331,10 +302,15 @@ def run(snapshot_date: date = None):
     total_dropped = 0
 
     try:
-        for region in REGIONS:
-            rows = fetch_sound_uses(region)
+        all_region_data = fetch_all_regions()
+        if not all_region_data:
+            log.warning("No data returned from TikTok — aborting")
+            raise RuntimeError("fetch_all_regions returned empty")
+
+        for region_label, raw_items in all_region_data.items():
+            rows = _parse_items(raw_items, region_label)
             if not rows:
-                log.warning(f"No rows for TikTok {region['label']} — skipping")
+                log.warning(f"No parseable rows for TikTok {region_label}")
                 continue
 
             for row in rows:
@@ -356,8 +332,6 @@ def run(snapshot_date: date = None):
                     conn.rollback()
                     log.error(f"Failed processing TikTok row '{row.get('title')}': {e}")
                     total_dropped += 1
-
-            time.sleep(3)  # pause between regions
 
         with conn.cursor() as cur:
             cur.execute("""
