@@ -44,7 +44,7 @@ INTENTIONALITY_TIKTOK = 0.80
 
 # ── Chart fetch ───────────────────────────────────────────────────────────────
 
-def fetch_trending_sounds(region: dict) -> list[dict]:
+def fetch_sound_uses(region: dict) -> list[dict]:
     """
     Load Creative Center, interact with the page to trigger the sound list
     API call, intercept the response, and return normalized track rows.
@@ -100,10 +100,7 @@ def fetch_trending_sounds(region: dict) -> list[dict]:
                 # Paginate with limit=20 (API max appears to be ~20)
                 all_items = []
                 for page_num in range(1, 4):  # up to 3 pages = ~60 tracks
-                    params = (
-                        f"rank_type=popular&period=7&page={page_num}&limit=20"
-                        f"&new_on_board=false&commercial_music=false"
-                    )
+                    params = f"rank_type=popular&period=7&page={page_num}&limit=20&new_on_board=false"
                     if region["country_code"]:
                         params += f"&country_code={region['country_code']}"
 
@@ -287,7 +284,7 @@ def write_signal(cur, song_id: str, row: dict,
             resolution_confidence, is_home_community,
             external_id, context_snapshot
         )
-        VALUES (%s, %s, 'tiktok', 'trending_sound',
+        VALUES (%s, %s, 'tiktok', 'sound_use',
                 %s, %s, %s, %s, %s, FALSE, %s, %s)
         ON CONFLICT DO NOTHING
     """, (
@@ -333,7 +330,7 @@ def run(snapshot_date: date = None):
 
     try:
         for region in REGIONS:
-            rows = fetch_trending_sounds(region)
+            rows = fetch_sound_uses(region)
             if not rows:
                 log.warning(f"No rows for TikTok {region['label']} — skipping")
                 continue
