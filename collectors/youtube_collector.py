@@ -229,6 +229,7 @@ def upsert_song_from_youtube(cur, row: dict) -> str:
     """, (
         row["title"],
         title_norm,
+        artist_id,
         f"yt_{row['video_id']}",
         [],
     ))
