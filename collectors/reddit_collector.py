@@ -180,9 +180,10 @@ MUSIC_COMMUNITY_TYPES = {"artist", "genre", "general_music"}
 # non-music communities (lifestyle, sports, etc.) before expensive resolution.
 MUSIC_SIGNALS = [
     r"\bsong\b", r"\btrack\b", r"\balbum\b", r"\blyrics?\b",
-    r"\blistening\b", r"\bplaying\b", r"\bmusic\b", r"\bbop\b",
-    r"\bsoundtrack\b", r"\bshazam", r"\bspotify\b", r"\bapple music\b",
-    r"\bsingle\b", r"\brelease\b", r"\bcover\b", r"\bremix\b",
+    r"\blistening to\b", r"\bmusic\b", r"\bbop\b", r"\bslaps\b",
+    r"\bsoundtrack\b", r"\bshazam\b", r"\bspotify\b", r"\bapple music\b",
+    r"\bremix\b", r"\bcover version\b", r"\bnow playing\b",
+    r"\bmusic video\b", r"\bfeat\b", r"\bfeaturing\b",
 ]
 MUSIC_PATTERN = re.compile("|".join(MUSIC_SIGNALS), re.IGNORECASE)
 
@@ -195,7 +196,7 @@ def has_music_signal(text: str, context: str = "") -> bool:
 # Single-word titles with English frequency above this require artist corroboration.
 # 1e-5 cleanly separates common words (perfect: 1.6e-4, baby: 1.8e-4)
 # from distinctive song titles (fortnight: 2.6e-6, espresso: 2.5e-6).
-_AMBIGUITY_FREQ_THRESHOLD = 1e-5
+_AMBIGUITY_FREQ_THRESHOLD = 5e-5
 
 @lru_cache(maxsize=2048)
 def _title_is_ambiguous(title_norm: str) -> bool:
@@ -317,11 +318,6 @@ def extract_candidate_mentions(text: str, context: str = "") -> list[str]:
                 candidates.update([part.strip() for part in m if part.strip()])
             else:
                 candidates.add(m.strip())
-
-    # 3. Include the full text as a candidate for LLM fallback
-    # (entity resolver will handle it if nothing else matches)
-    if len(text.strip()) < 200:
-        candidates.add(text.strip())
 
     return [c for c in candidates if 3 < len(c) < 100]
 
@@ -629,7 +625,9 @@ def _resolve_items(conn, items: list[dict], community_id: str,
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     song_id, confidence, method = resolve_candidate(cur, candidate, context)
 
-                    if confidence >= MIN_RESOLUTION_CONFIDENCE and song_id:
+                    # Non-music communities require stronger evidence
+                    min_conf = MIN_RESOLUTION_CONFIDENCE if is_music_community else 0.85
+                    if confidence >= min_conf and song_id:
                         if write_signal_event(cur, song_id, community_id,
                                               signal_type, item, confidence, context):
                             written += 1
