@@ -5,3 +5,4 @@ rapidfuzz>=3.6
 python-dotenv>=1.0
 wordfreq>=3.0
 playwright>=1.44
+feedparser>=6.0
