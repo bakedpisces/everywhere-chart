@@ -113,16 +113,21 @@ def fetch_trending_sounds(region: dict) -> list[dict]:
 
 def _parse_response(data: dict, region: dict) -> list[dict]:
     """Extract track rows from the Creative Center rank_list API JSON."""
+    log.info(f"TikTok response top-level keys for {region['label']}: {list(data.keys())}")
     inner = data.get("data", {})
+    if isinstance(inner, dict):
+        log.info(f"TikTok data keys: {list(inner.keys())}")
+    else:
+        log.info(f"TikTok data type: {type(inner).__name__}, value[:200]: {str(inner)[:200]}")
     # rank_list endpoint uses "list"; older endpoints used "music_list"
     items = (
         inner.get("list")
         or inner.get("music_list")
         or inner.get("sound_list")
         or []
-    )
+    ) if isinstance(inner, dict) else (inner if isinstance(inner, list) else [])
     if not items:
-        log.warning(f"TikTok API shape for {region['label']}: data keys={list(inner.keys())}")
+        log.warning(f"No items found in TikTok response for {region['label']}")
         return []
 
     rows = []
