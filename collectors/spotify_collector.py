@@ -110,81 +110,55 @@ def _parse_chart_response(data: dict, chart: dict) -> list[dict]:
 
 def fetch_all_charts() -> dict[str, list[dict]]:
     """
-    Launch one Playwright browser, optionally inject the sp_dc session
-    cookie, load each chart page, and intercept the API response.
+    Fetch Spotify chart data directly from the charts API.
 
-    With sp_dc: captures auth/v0 response (200 songs per chart).
-    Without:    captures public/v0 response (50 songs per chart).
+    With sp_dc cookie: uses auth/v0 endpoint (200 songs per chart).
+    Without:           uses public/v0 endpoint (50 songs per chart).
+
+    No browser/Playwright needed — the sp_dc session cookie is sent
+    directly in the request headers.
 
     Returns {chart_name: [rows]}.
     """
-    from playwright.sync_api import sync_playwright
+    # Browser-like headers to avoid bot detection
+    base_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept":          "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer":         "https://charts.spotify.com/",
+        "Origin":          "https://charts.spotify.com",
+    }
+
+    if SPOTIFY_SP_DC:
+        base_headers["Cookie"] = f"sp_dc={SPOTIFY_SP_DC}"
+        api_path = CHARTS_AUTH_PATH
+        log.info("sp_dc present — using auth/v0 endpoint (200 songs)")
+    else:
+        api_path = CHARTS_PUBLIC_PATH
+        log.info("No sp_dc — using public/v0 endpoint (50 songs)")
 
     results = {}
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-
-        # Inject session cookie once into a shared browser context
-        ctx_kwargs = {}
-        if SPOTIFY_SP_DC:
-            ctx_kwargs["storage_state"] = {
-                "cookies": [{
-                    "name":   "sp_dc",
-                    "value":  SPOTIFY_SP_DC,
-                    "domain": ".spotify.com",
-                    "path":   "/",
-                    "secure": True,
-                    "httpOnly": True,
-                    "sameSite": "Lax",
-                }]
-            }
-            log.info("sp_dc cookie injected — using auth/v0 endpoint (200 songs)")
-        else:
-            log.info("No sp_dc — using public/v0 endpoint (50 songs)")
-
-        context = browser.new_context(**ctx_kwargs)
-
-        for chart in CHARTS_TO_FETCH:
-            page     = context.new_page()
-            captured = {}
-
-            def on_response(response, captured=captured):
-                if CHARTS_API_HOST not in response.url or response.status != 200:
-                    return
-                # Prefer auth/v0 (200 songs); also accept public/v0 as fallback
-                if CHARTS_AUTH_PATH in response.url or CHARTS_PUBLIC_PATH in response.url:
-                    if CHARTS_AUTH_PATH in response.url or "data" not in captured:
-                        try:
-                            captured["data"] = response.json()
-                            captured["url"]  = response.url
-                        except Exception:
-                            pass
-
-            page.on("response", on_response)
-
-            try:
-                page.goto(chart["page_url"], wait_until="networkidle", timeout=45_000)
-            except Exception as e:
-                log.warning(f"Page load failed for {chart['name']}: {e}")
-                page.close()
-                results[chart["name"]] = []
-                continue
-
-            if not captured:
-                log.warning(f"No API response captured for {chart['name']}")
-                page.close()
-                results[chart["name"]] = []
-                continue
-
-            rows = _parse_chart_response(captured["data"], chart)
-            src  = "auth/v0" if CHARTS_AUTH_PATH in captured.get("url", "") else "public/v0"
-            log.info(f"Fetched {len(rows)} entries from Spotify {chart['name']} via {src}")
+    for chart in CHARTS_TO_FETCH:
+        url = f"https://{CHARTS_API_HOST}{api_path}/{chart['chart_path']}"
+        try:
+            resp = requests.get(url, headers=base_headers, timeout=(10, 30))
+            if resp.status_code == 401 and SPOTIFY_SP_DC:
+                # sp_dc expired — fall back to public endpoint
+                log.warning("sp_dc auth failed (401) — falling back to public/v0")
+                url  = f"https://{CHARTS_API_HOST}{CHARTS_PUBLIC_PATH}/{chart['chart_path']}"
+                resp = requests.get(url, headers=base_headers, timeout=(10, 30))
+            resp.raise_for_status()
+            rows = _parse_chart_response(resp.json(), chart)
+            src  = "auth/v0" if api_path == CHARTS_AUTH_PATH else "public/v0"
+            log.info(f"Fetched {len(rows)} entries from {chart['name']} via {src}")
             results[chart["name"]] = rows
-            page.close()
-
-        context.close()
-        browser.close()
+        except Exception as e:
+            log.warning(f"Chart fetch failed for {chart['name']}: {e}")
+            results[chart["name"]] = []
 
     return results
 
