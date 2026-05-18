@@ -42,7 +42,7 @@ YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 MUSIC_CATEGORY   = "10"   # YouTube Music category ID
 MAX_RESULTS      = 50
 
-REGIONS_TO_FETCH = ["US", "GB", "AU", "BR"]
+REGIONS_TO_FETCH = ["US", "GB", "AU", "BR", "CA", "DE", "MX", "IN", "KR"]
 
 # Passive signal — YouTube autoplay inflates views vs intentional listening
 INTENTIONALITY_SCORE = 0.20
@@ -185,6 +185,65 @@ def resolve_song(cur, title: str, channel: str) -> tuple[Optional[str], float]:
             return str(best["id"]), round(combined_sim * 0.9, 3)
 
     return None, 0.0
+
+
+def upsert_song_from_youtube(cur, row: dict) -> str:
+    """
+    Add a YouTube trending video to the catalog as a new song.
+    Uses channel name as artist — good enough for matching future signals.
+    Returns the song_id.
+    """
+    channel_norm = normalize_channel(row["channel"])
+    title_norm   = normalize(row["title"])
+
+    # Upsert artist
+    cur.execute("""
+        INSERT INTO artists (name, name_normalized, spotify_artist_id, genre_tags)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (spotify_artist_id) DO UPDATE SET
+            name = EXCLUDED.name,
+            updated_at = NOW()
+        RETURNING id
+    """, (
+        row["channel"],
+        channel_norm,
+        f"yt_{channel_norm[:40]}",
+        [],
+    ))
+    artist_row = cur.fetchone()
+    if artist_row:
+        artist_id = str(artist_row["id"])
+    else:
+        cur.execute(
+            "SELECT id FROM artists WHERE name_normalized = %s LIMIT 1",
+            (channel_norm,)
+        )
+        artist_id = str(cur.fetchone()["id"])
+
+    # Upsert song
+    cur.execute("""
+        INSERT INTO songs (title, title_normalized, artist_id, spotify_track_id, genre_tags)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (spotify_track_id) DO NOTHING
+        RETURNING id
+    """, (
+        row["title"],
+        title_norm,
+        f"yt_{row['video_id']}",
+        [],
+    ))
+    song_row = cur.fetchone()
+    if song_row:
+        song_id = str(song_row["id"])
+        log.info(f"New song from YouTube: {row['title']} — {row['channel']}")
+    else:
+        cur.execute(
+            "SELECT id FROM songs WHERE spotify_track_id = %s",
+            (f"yt_{row['video_id']}",)
+        )
+        song_id = str(cur.fetchone()["id"])
+
+    return song_id
 
 
 def queue_for_resolution(cur, row: dict, snapshot_date: date):
@@ -336,10 +395,10 @@ def run(snapshot_date: date = None):
                     song_id, confidence = resolve_song(cur, row["title"], row["channel"])
 
                     if confidence < 0.65:
-                        queue_for_resolution(cur, row, snapshot_date)
+                        # Add to catalog so future runs can match it
+                        song_id = upsert_song_from_youtube(cur, row)
+                        confidence = 0.70  # YouTube-sourced catalog entry
                         total_queued += 1
-                        conn.commit()
-                        continue
 
                     insert_signal_event(cur, song_id, row, confidence, snapshot_date)
                     total_events += 1
