@@ -573,8 +573,8 @@ def run(snapshot_date: date = None):
                     comm_id = get_community(slug, article["source_name"], article["pub_type"])
 
                     with conn.cursor() as cur:
-                        write_signal(cur, song["id"], comm_id, article,
-                                     article["pub_type"], confidence=0.95)
+                        write_feed_signal(cur, song["id"], comm_id, article,
+                                          article["pub_type"], confidence=0.95)
                         total_events += 1
                     conn.commit()
                 except Exception as e:
@@ -602,8 +602,8 @@ def run(snapshot_date: date = None):
                     for song_id, confidence in matches:
                         try:
                             with conn.cursor() as cur:
-                                write_signal(cur, song_id, comm_id, article,
-                                             feed_cfg["pub_type"], confidence)
+                                write_feed_signal(cur, song_id, comm_id, article,
+                                                  feed_cfg["pub_type"], confidence)
                                 total_events += 1
                             conn.commit()
                         except Exception as e:
