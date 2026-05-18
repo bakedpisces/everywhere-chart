@@ -311,12 +311,23 @@ def upsert_artist(cur, name: str, spotify_id: str = None,
     )
     return str(cur.fetchone()["id"])
 
+def _normalize_release_date(raw: Optional[str]) -> Optional[str]:
+    """Spotify returns 'YYYY', 'YYYY-MM', or 'YYYY-MM-DD'. Postgres needs full date."""
+    if not raw:
+        return None
+    parts = raw.split("-")
+    if len(parts) == 1:
+        return f"{parts[0]}-01-01"
+    if len(parts) == 2:
+        return f"{parts[0]}-{parts[1]}-01"
+    return raw  # already YYYY-MM-DD
+
 def upsert_song(cur, title: str, artist_id: str, spotify_id: str,
                 meta: Optional[dict]) -> str:
     """Insert or update song record. Returns internal UUID."""
     isrc      = meta.get("isrc") if meta else None
     genres    = meta.get("genre_tags", []) if meta else []
-    rel_date  = meta.get("release_date") if meta else None
+    rel_date  = _normalize_release_date(meta.get("release_date") if meta else None)
     track_key = spotify_id or f"unknown_{normalize(title)}"
 
     cur.execute("""
