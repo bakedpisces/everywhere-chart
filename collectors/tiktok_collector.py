@@ -35,8 +35,10 @@ CREATIVE_CENTER_URL = (
 API_LIST_URL = "https://ads.tiktok.com/creative_radar_api/v1/popular_trend/sound/rank_list"
 
 REGIONS = [
-    {"country_code": "",   "label": "global"},
     {"country_code": "US", "label": "us"},
+    {"country_code": "GB", "label": "uk"},
+    {"country_code": "AU", "label": "au"},
+    {"country_code": "BR", "label": "br"},
 ]
 
 # TikTok usage = creator intentionally chose this sound — high intentionality
