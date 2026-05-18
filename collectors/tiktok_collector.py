@@ -65,47 +65,72 @@ def fetch_trending_sounds(region: dict) -> list[dict]:
         page = context.new_page()
 
 
+        def on_request(request):
+            """Capture auth headers from the page's own rank_list call."""
+            if "rank_list" in request.url and "ads.tiktok.com" in request.url:
+                captured["req_headers"] = dict(request.headers)
+                log.info(f"Captured rank_list request headers for {region['label']}")
+
+        def on_response(response):
+            """Capture the page's own rank_list response as fallback."""
+            if "rank_list" in response.url and "ads.tiktok.com" in response.url and response.status == 200:
+                try:
+                    body = response.json()
+                    if body.get("data"):
+                        captured["page_data"] = body
+                        log.info(f"Captured page rank_list response for {region['label']}")
+                except Exception:
+                    pass
+
+        page.on("request",  on_request)
+        page.on("response", on_response)
+
         try:
-            url = CREATIVE_CENTER_URL
+            page_url = CREATIVE_CENTER_URL
             if region["country_code"]:
-                url += f"?country_code={region['country_code']}"
-            page.goto(url, wait_until="networkidle", timeout=60_000)
+                page_url += f"?country_code={region['country_code']}"
+            page.goto(page_url, wait_until="networkidle", timeout=60_000)
             page.wait_for_timeout(4_000)
 
-            # Scroll to warm up the session (triggers rank_list internally)
+            # Scroll to trigger the rank_list call from the page's own JS
             page.mouse.wheel(0, 800)
-            page.wait_for_timeout(4_000)
+            page.wait_for_timeout(6_000)
 
-            # Call rank_list directly via page.request — inherits all session cookies/tokens
-            params = (
-                f"rank_type=popular&period=7&page=1&limit=50"
-                f"&new_on_board=false&commercial_music=false"
-            )
-            if region["country_code"]:
-                params += f"&country_code={region['country_code']}"
+            if "req_headers" in captured:
+                # Replay with the page's own auth headers but limit=50
+                params = (
+                    "rank_type=popular&period=7&page=1&limit=50"
+                    "&new_on_board=false&commercial_music=false"
+                )
+                if region["country_code"]:
+                    params += f"&country_code={region['country_code']}"
 
-            resp = page.request.get(
-                f"{API_LIST_URL}?{params}",
-                headers={
-                    "Referer": CREATIVE_CENTER_URL,
-                    "Accept":  "application/json, text/plain, */*",
-                },
-                timeout=20_000,
-            )
-            log.info(f"rank_list status={resp.status} for {region['label']}")
-            if resp.status == 200:
-                captured["data"] = resp.json()
-            else:
-                log.warning(f"rank_list returned {resp.status} for {region['label']}")
+                resp = page.request.get(
+                    f"{API_LIST_URL}?{params}",
+                    headers=captured["req_headers"],
+                    timeout=20_000,
+                )
+                log.info(f"rank_list replay status={resp.status} for {region['label']}")
+                if resp.status == 200:
+                    body = resp.json()
+                    if body.get("data"):
+                        captured["data"] = body
+                    else:
+                        log.warning(f"replay: code={body.get('code')} msg={body.get('msg')}")
+                        if "page_data" in captured:
+                            captured["data"] = captured["page_data"]
+            elif "page_data" in captured:
+                log.info(f"Using page's intercepted rank_list data for {region['label']}")
+                captured["data"] = captured["page_data"]
 
         except Exception as e:
-            log.warning(f"Page evaluation failed for TikTok {region['label']}: {e}")
+            log.warning(f"TikTok fetch failed for {region['label']}: {e}")
         finally:
             context.close()
             browser.close()
 
-    if not captured:
-        log.warning(f"No list API response captured for TikTok {region['label']}")
+    if "data" not in captured:
+        log.warning(f"No data captured for TikTok {region['label']}")
         return []
 
     return _parse_response(captured["data"], region)
