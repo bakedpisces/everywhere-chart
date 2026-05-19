@@ -211,6 +211,48 @@ def resolve_song(cur, row: dict) -> tuple[Optional[str], float]:
     return None, 0.0
 
 
+def upsert_song_from_tiktok(cur, row: dict) -> str:
+    """
+    Add a TikTok trending sound to the catalog when resolution fails.
+    Returns song_id.
+    """
+    artist_norm = normalize(row["artist"])
+    title_norm  = normalize(row["title"])
+    fake_artist_id = f"tiktok_{artist_norm[:40]}"
+
+    cur.execute("""
+        INSERT INTO artists (name, name_normalized, spotify_artist_id, genre_tags)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (spotify_artist_id) DO UPDATE SET
+            name = EXCLUDED.name, updated_at = NOW()
+        RETURNING id
+    """, (row["artist"], artist_norm, fake_artist_id, []))
+    artist_row = cur.fetchone()
+    if artist_row:
+        artist_id = str(artist_row["id"])
+    else:
+        cur.execute("SELECT id FROM artists WHERE name_normalized = %s LIMIT 1", (artist_norm,))
+        artist_id = str(cur.fetchone()["id"])
+
+    fake_track_id = f"tiktok_{row['tiktok_id']}" if row["tiktok_id"] else f"tiktok_{artist_norm[:20]}_{title_norm[:20]}"
+
+    cur.execute("""
+        INSERT INTO songs (title, title_normalized, artist_id, spotify_track_id, genre_tags)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (spotify_track_id) DO NOTHING
+        RETURNING id
+    """, (row["title"], title_norm, artist_id, fake_track_id, []))
+    song_row = cur.fetchone()
+    if song_row:
+        song_id = str(song_row["id"])
+        log.info(f"New song from TikTok: {row['title']} — {row['artist']}")
+    else:
+        cur.execute("SELECT id FROM songs WHERE spotify_track_id = %s", (fake_track_id,))
+        song_id = str(cur.fetchone()["id"])
+
+    return song_id
+
+
 def queue_unresolved(cur, row: dict, snapshot_date: date):
     """Queue unmatched TikTok tracks for future resolution."""
     external_id = f"tiktok::{row['tiktok_id']}::{row['region']}::{snapshot_date}"
@@ -319,10 +361,10 @@ def run(snapshot_date: date = None):
                         song_id, confidence = resolve_song(cur, row)
 
                         if confidence < 0.65:
-                            queue_unresolved(cur, row, snapshot_date)
+                            # Add to catalog so the signal is counted now
+                            song_id = upsert_song_from_tiktok(cur, row)
+                            confidence = 0.70
                             total_queued += 1
-                            conn.commit()
-                            continue
 
                         write_signal(cur, song_id, row, snapshot_date, confidence)
                         total_events += 1

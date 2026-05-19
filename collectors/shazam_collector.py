@@ -166,6 +166,52 @@ def resolve_song(cur, row: dict) -> tuple[Optional[str], float]:
 
     return None, 0.0
 
+def upsert_song_from_shazam(cur, row: dict) -> str:
+    """
+    Add a Shazam charting song to the catalog when resolution fails.
+    Uses shazam_ prefix IDs so future runs can match via shazam_id.
+    Returns song_id.
+    """
+    import re
+    def _norm(s): return re.sub(r"[^\w\s]", "", s.lower().strip())
+
+    artist_norm = _norm(row["artist_name"])
+    title_norm  = _norm(row["song_title"])
+    fake_artist_id = f"shazam_{artist_norm[:40]}"
+
+    cur.execute("""
+        INSERT INTO artists (name, name_normalized, spotify_artist_id, genre_tags)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (spotify_artist_id) DO UPDATE SET
+            name = EXCLUDED.name, updated_at = NOW()
+        RETURNING id
+    """, (row["artist_name"], artist_norm, fake_artist_id, []))
+    artist_row = cur.fetchone()
+    if artist_row:
+        artist_id = str(artist_row["id"])
+    else:
+        cur.execute("SELECT id FROM artists WHERE name_normalized = %s LIMIT 1", (artist_norm,))
+        artist_id = str(cur.fetchone()["id"])
+
+    fake_track_id = f"shazam_{row['shazam_id']}" if row["shazam_id"] else f"shazam_{artist_norm[:20]}_{title_norm[:20]}"
+
+    cur.execute("""
+        INSERT INTO songs (title, title_normalized, artist_id, spotify_track_id, genre_tags)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (spotify_track_id) DO NOTHING
+        RETURNING id
+    """, (row["song_title"], title_norm, artist_id, fake_track_id, []))
+    song_row = cur.fetchone()
+    if song_row:
+        song_id = str(song_row["id"])
+        log.info(f"New song from Shazam: {row['song_title']} — {row['artist_name']}")
+    else:
+        cur.execute("SELECT id FROM songs WHERE spotify_track_id = %s", (fake_track_id,))
+        song_id = str(cur.fetchone()["id"])
+
+    return song_id
+
+
 def queue_for_resolution(cur, row: dict, chart: dict,
                           snapshot_date: date, candidates: list) -> str:
     """Add unresolved song to the resolution queue."""
@@ -261,11 +307,10 @@ def run(snapshot_date: date = None):
                         song_id, confidence = resolve_song(cur, row)
 
                         if confidence < 0.65:
-                            # queue for LLM disambiguation
-                            queue_for_resolution(cur, row, chart, snapshot_date, [])
+                            # Add to catalog so the signal is counted now
+                            song_id = upsert_song_from_shazam(cur, row)
+                            confidence = 0.70
                             total_queued += 1
-                            conn.commit()
-                            continue
 
                         # insert snapshot
                         cur.execute("""
