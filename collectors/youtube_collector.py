@@ -62,44 +62,6 @@ def normalize_channel(channel: str) -> str:
     return normalize(channel.strip())
 
 
-def clean_youtube_title(title: str, channel: str) -> str:
-    """
-    Extract the core song title from a YouTube video title.
-
-    Handles patterns like:
-      "Hotboii Feat. Lil Baby - Alicia (Official Video)"  → "alicia"
-      "Taylor Swift - Anti-Hero (Official Music Video)"   → "anti hero"
-      "SZA - Kill Bill (Lyrics)"                          → "kill bill"
-    """
-    t = title.strip()
-
-    # 1. Remove trailing parenthetical/bracket noise
-    noise = re.compile(
-        r'\s*[\(\[]\s*(?:official\s*(?:music\s*)?(?:video|audio|mv)?|'
-        r'lyrics?|visualizer|4k|hd|explicit|clean|audio|live|'
-        r'music\s*video|version|dir\.?[^)\]]*)\s*[\)\]]',
-        re.IGNORECASE,
-    )
-    t = noise.sub("", t).strip()
-
-    # 2. If "Artist - Song" pattern, take the right-hand side when the
-    #    left side looks like the channel name.
-    parts = re.split(r"\s*[-–—]\s*", t, maxsplit=1)
-    if len(parts) == 2:
-        left_norm = normalize(parts[0])
-        chan_norm  = normalize_channel(channel)
-        if chan_norm and len(chan_norm) >= 3:
-            left_words = set(left_norm.split())
-            chan_words  = set(chan_norm.split())
-            overlap = len(left_words & chan_words) / max(len(chan_words), 1)
-            if overlap >= 0.5 or chan_norm in left_norm or left_norm in chan_norm:
-                t = parts[1].strip()
-
-    # 3. Strip "Feat. …" that may remain after the dash split
-    t = re.sub(r"\s+feat\.?\s+.*$", "", t, flags=re.IGNORECASE).strip()
-
-    return t
-
 
 def _connect():
     return psycopg2.connect(
@@ -179,66 +141,118 @@ def fetch_trending_music(region: str) -> list[dict]:
 
 # ── Song resolution ───────────────────────────────────────────────────────────
 
+def extract_artist_title_from_video(title: str, channel: str) -> list[tuple[str, str]]:
+    """
+    Return a list of (artist_norm, title_norm) candidates to try for matching.
+
+    Handles:
+    - "The Killers - Mr. Brightside (Lyrics)"  → [("the killers", "mr brightside"), ...]
+    - "Hotboii Feat. Lil Baby - Alicia (Official Video)" → [("hotboii feat lil baby", "alicia"), ...]
+    - Plain title with channel as artist       → [("channel_norm", "title_norm")]
+    """
+    channel_norm = normalize_channel(channel)
+    candidates: list[tuple[str, str]] = []
+
+    # Strip trailing noise from title
+    noise = re.compile(
+        r'\s*[\(\[]\s*(?:official\s*(?:music\s*)?(?:video|audio|mv)?|'
+        r'lyrics?|visualizer|4k|hd|explicit|clean|audio|live|'
+        r'music\s*video|version|dir\.?[^)\]]*)\s*[\)\]]',
+        re.IGNORECASE,
+    )
+    t_clean = noise.sub("", title).strip()
+
+    # Try "Artist - Song" split (dash as separator)
+    parts = re.split(r"\s*[-–—]\s*", t_clean, maxsplit=1)
+    if len(parts) == 2:
+        left_raw, right_raw = parts
+        # Strip feat. from left (artist) side
+        left_raw  = re.sub(r"\s+(?:feat\.?|ft\.?|featuring)\s+.*$", "", left_raw, flags=re.IGNORECASE).strip()
+        # Strip feat. from right (title) side
+        right_raw = re.sub(r"\s+(?:feat\.?|ft\.?|featuring)\s+.*$", "", right_raw, flags=re.IGNORECASE).strip()
+
+        extracted_artist = normalize(left_raw)
+        extracted_title  = normalize(right_raw)
+
+        if extracted_artist and extracted_title:
+            # Highest confidence: channel matches extracted artist
+            left_words = set(extracted_artist.split())
+            chan_words  = set(channel_norm.split()) if channel_norm else set()
+            overlap = len(left_words & chan_words) / max(len(chan_words), 1) if chan_words else 0
+
+            if overlap >= 0.4 or (channel_norm and (channel_norm in extracted_artist or extracted_artist in channel_norm)):
+                candidates.append((extracted_artist, extracted_title))  # high confidence
+            else:
+                # Channel differs (e.g. lyrics uploader) — still try the title split,
+                # but also try channel as artist with extracted title
+                candidates.append((extracted_artist, extracted_title))
+                candidates.append((channel_norm, extracted_title))
+
+    # Always try channel as artist with full normalized title (minus noise)
+    full_title_norm = normalize(t_clean)
+    candidates.append((channel_norm, full_title_norm))
+
+    # Deduplicate while preserving order
+    seen: set[tuple[str, str]] = set()
+    unique: list[tuple[str, str]] = []
+    for c in candidates:
+        if c not in seen and c[0] and c[1]:
+            seen.add(c)
+            unique.append(c)
+    return unique
+
+
 def resolve_song(cur, title: str, channel: str) -> tuple[Optional[str], float]:
     """
     Attempt to match a YouTube video to an existing song in catalog.
     Returns (song_id, confidence) or (None, 0.0).
 
     Strategy:
-    1. Exact normalized match on raw title + channel
-    2. Exact normalized match on cleaned title + channel
-    3. pg_trgm fuzzy match on cleaned title + channel
-    4. Substring search: catalog song title contained in YouTube title
+    1. For each (artist, title) candidate: exact normalized match
+    2. For each candidate: pg_trgm fuzzy match
+    3. Substring: catalog title contained in YouTube title, artist fuzzy on channel
     """
-    title_norm        = normalize(title)
-    channel_norm      = normalize_channel(channel)
-    clean_title       = clean_youtube_title(title, channel)
-    clean_title_norm  = normalize(clean_title)
+    title_norm   = normalize(title)
+    channel_norm = normalize_channel(channel)
+    candidates   = extract_artist_title_from_video(title, channel)
 
-    def _exact(t_norm):
+    # ── Pass 1: exact match on each candidate ────────────────────────────────
+    for i, (artist_n, song_n) in enumerate(candidates):
         cur.execute("""
             SELECT s.id FROM songs s
             JOIN artists a ON s.artist_id = a.id
             WHERE s.title_normalized = %s
               AND a.name_normalized  = %s
             LIMIT 1
-        """, (t_norm, channel_norm))
-        return cur.fetchone()
-
-    # 1. Exact match on raw title
-    result = _exact(title_norm)
-    if result:
-        return str(result["id"]), 0.95
-
-    # 2. Exact match on cleaned title
-    if clean_title_norm != title_norm:
-        result = _exact(clean_title_norm)
+        """, (song_n, artist_n))
+        result = cur.fetchone()
         if result:
-            return str(result["id"]), 0.92
+            conf = 0.95 if i == 0 else 0.90
+            return str(result["id"]), conf
 
-    # 3. Fuzzy match on cleaned title
-    cur.execute("""
-        SELECT s.id,
-               similarity(s.title_normalized, %s) AS title_sim,
-               similarity(a.name_normalized, %s)  AS artist_sim
-        FROM songs s
-        JOIN artists a ON s.artist_id = a.id
-        WHERE similarity(s.title_normalized, %s) > 0.55
-          AND similarity(a.name_normalized, %s)  > 0.45
-        ORDER BY (similarity(s.title_normalized, %s) + similarity(a.name_normalized, %s)) DESC
-        LIMIT 3
-    """, (clean_title_norm, channel_norm,
-          clean_title_norm, channel_norm,
-          clean_title_norm, channel_norm))
-    results = cur.fetchall()
-    if results:
-        best = results[0]
-        combined_sim = (best["title_sim"] + best["artist_sim"]) / 2
-        if combined_sim >= 0.70:
-            return str(best["id"]), round(combined_sim * 0.9, 3)
+    # ── Pass 2: fuzzy match on each candidate ────────────────────────────────
+    for i, (artist_n, song_n) in enumerate(candidates):
+        cur.execute("""
+            SELECT s.id,
+                   similarity(s.title_normalized, %s) AS title_sim,
+                   similarity(a.name_normalized, %s)  AS artist_sim
+            FROM songs s
+            JOIN artists a ON s.artist_id = a.id
+            WHERE similarity(s.title_normalized, %s) > 0.55
+              AND similarity(a.name_normalized, %s)  > 0.45
+            ORDER BY (similarity(s.title_normalized, %s) + similarity(a.name_normalized, %s)) DESC
+            LIMIT 3
+        """, (song_n, artist_n, song_n, artist_n, song_n, artist_n))
+        results = cur.fetchall()
+        if results:
+            best = results[0]
+            combined_sim = (best["title_sim"] + best["artist_sim"]) / 2
+            if combined_sim >= 0.68:
+                penalty = 0.9 if i == 0 else 0.82
+                return str(best["id"]), round(combined_sim * penalty, 3)
 
-    # 4. Substring: find catalog titles contained within the YouTube title
-    #    (handles "Hotboii Feat. Lil Baby - Alicia (Official Video)" → "alicia")
+    # ── Pass 3: substring — catalog title contained in YouTube title ──────────
+    #    handles "Hotboii Feat. Lil Baby - Alicia (Official Video)" → finds "alicia"
     cur.execute("""
         SELECT s.id, s.title_normalized,
                similarity(a.name_normalized, %s) AS artist_sim
@@ -246,15 +260,15 @@ def resolve_song(cur, title: str, channel: str) -> tuple[Optional[str], float]:
         JOIN artists a ON s.artist_id = a.id
         WHERE length(s.title_normalized) >= 4
           AND position(s.title_normalized IN %s) > 0
-          AND similarity(a.name_normalized, %s) > 0.45
+          AND similarity(a.name_normalized, %s) > 0.40
         ORDER BY artist_sim DESC, length(s.title_normalized) DESC
         LIMIT 3
     """, (channel_norm, title_norm, channel_norm))
     results = cur.fetchall()
     if results:
         best = results[0]
-        if best["artist_sim"] >= 0.60:
-            return str(best["id"]), round(best["artist_sim"] * 0.85, 3)
+        if best["artist_sim"] >= 0.55:
+            return str(best["id"]), round(best["artist_sim"] * 0.82, 3)
 
     return None, 0.0
 
