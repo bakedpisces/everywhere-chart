@@ -101,11 +101,26 @@ def fetch_all_regions() -> dict[str, list[dict]]:
         pg = context.new_page()
 
         def on_request(request):
-            if "rank_list" in request.url and "ads.tiktok.com" in request.url:
-                auth_headers.update(dict(request.headers))
-                log.info("Captured rank_list auth headers")
+            url = request.url
+            if "ads.tiktok.com" in url or "creative" in url.lower():
+                if "rank_list" in url or "sound" in url or "music" in url or "trend" in url:
+                    log.info(f"Intercepted API call: {url[:120]}")
+                    if "rank_list" in url:
+                        auth_headers.update(dict(request.headers))
+                        log.info("Captured rank_list auth headers")
 
         pg.on("request", on_request)
+
+        # Selectors that may trigger the rank_list API call
+        MUSIC_SELECTORS = [
+            "text=Music",
+            "[class*='music']",
+            "[class*='Music']",
+            "[data-e2e*='music']",
+            "li:has-text('Music')",
+            "a:has-text('Music')",
+            "[class*='tab']:has-text('Music')",
+        ]
 
         try:
             for warmup_code in WARMUP_CODES:
@@ -119,14 +134,36 @@ def fetch_all_regions() -> dict[str, list[dict]]:
                         wait_until="networkidle",
                         timeout=60_000,
                     )
-                    # Scroll progressively to trigger lazy API calls
+                    pg.wait_for_timeout(3_000)
+
+                    if auth_headers:
+                        break
+
+                    # Try clicking Music tab selectors to trigger rank_list
+                    for sel in MUSIC_SELECTORS:
+                        if auth_headers:
+                            break
+                        try:
+                            el = pg.locator(sel).first
+                            if el.count() > 0:
+                                el.click(timeout=3_000)
+                                log.info(f"Clicked '{sel}' on {warmup_code}")
+                                pg.wait_for_timeout(3_000)
+                        except Exception:
+                            pass
+
+                    if auth_headers:
+                        break
+
+                    # Fallback: scroll progressively
                     for scroll_y in [400, 800, 1200]:
                         pg.mouse.wheel(0, scroll_y)
                         pg.wait_for_timeout(2_000)
                         if auth_headers:
                             break
-                    if not auth_headers:
-                        pg.wait_for_timeout(3_000)  # extra grace period
+
+                    pg.wait_for_timeout(3_000)
+
                 except Exception as e:
                     log.warning(f"Warmup page {warmup_code} failed: {e}")
 
