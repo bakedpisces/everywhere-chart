@@ -78,13 +78,16 @@ def _fetch_region(page_request, auth_headers: dict, region: dict) -> list[dict]:
 
 def fetch_all_regions() -> dict[str, list[dict]]:
     """
-    Launch ONE browser, load AU page to reliably capture auth headers,
+    Launch ONE browser, try several country codes to capture auth headers,
     then call rank_list for every region using those headers.
     Returns {region_label: [rows]}.
     """
     from playwright.sync_api import sync_playwright
 
     auth_headers = {}
+
+    # Try these country codes in order until one fires rank_list
+    WARMUP_CODES = ["AU", "GB", "US", "BR"]
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -105,15 +108,30 @@ def fetch_all_regions() -> dict[str, list[dict]]:
         pg.on("request", on_request)
 
         try:
-            # AU reliably triggers rank_list — use it to warm the session
-            pg.goto(f"{CREATIVE_CENTER_URL}?country_code=AU",
-                    wait_until="networkidle", timeout=60_000)
-            pg.wait_for_timeout(4_000)
-            pg.mouse.wheel(0, 800)
-            pg.wait_for_timeout(5_000)
+            for warmup_code in WARMUP_CODES:
+                if auth_headers:
+                    break
+
+                log.info(f"Trying warmup page: {warmup_code}")
+                try:
+                    pg.goto(
+                        f"{CREATIVE_CENTER_URL}?country_code={warmup_code}",
+                        wait_until="networkidle",
+                        timeout=60_000,
+                    )
+                    # Scroll progressively to trigger lazy API calls
+                    for scroll_y in [400, 800, 1200]:
+                        pg.mouse.wheel(0, scroll_y)
+                        pg.wait_for_timeout(2_000)
+                        if auth_headers:
+                            break
+                    if not auth_headers:
+                        pg.wait_for_timeout(3_000)  # extra grace period
+                except Exception as e:
+                    log.warning(f"Warmup page {warmup_code} failed: {e}")
 
             if not auth_headers:
-                log.warning("rank_list never fired on AU page — no auth headers")
+                log.warning("rank_list never fired on any warmup page — no auth headers")
                 return {}
 
             log.info(f"Auth headers captured — fetching {len(REGIONS)} regions")
