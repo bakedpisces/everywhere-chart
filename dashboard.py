@@ -40,6 +40,40 @@ header[data-testid="stHeader"] { display: none; }
 </style>
 """, unsafe_allow_html=True)
 
+# ── Password gate ─────────────────────────────────────────────────────────────
+
+def _check_password() -> bool:
+    """Return True if the user has entered the correct password."""
+    correct = st.secrets.get("APP_PASSWORD", os.environ.get("APP_PASSWORD", "civilwar"))
+
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.markdown("""
+    <style>
+    .login-wrap { max-width: 340px; margin: 15vh auto 0; text-align: center; }
+    .login-title { font-size: 1.6rem; font-weight: 600; margin-bottom: 0.25rem; }
+    .login-sub { color: #888; font-size: 0.85rem; margin-bottom: 1.5rem; }
+    </style>
+    <div class="login-wrap">
+      <div class="login-title">🌍 Everywhere Chart</div>
+      <div class="login-sub">Enter the access password to continue</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    pw = st.text_input("Password", type="password", label_visibility="collapsed",
+                       placeholder="Password")
+    if pw:
+        if pw == correct:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    return False
+
+if not _check_password():
+    st.stop()
+
 # ── Data loading (cached) ─────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner="Loading signals from database...")
