@@ -14,8 +14,10 @@
 # Reddit — every 6 hours, offset by 1h from Shazam to spread load
 0 1,7,13,19 * * * cd /app && python -m collectors.reddit_collector >> /var/log/everywhere-chart/reddit.log 2>&1
 
-# Spotify Playlist Seeder — daily at 07:00 UTC (before Spotify chart collector)
-0 7 * * * cd /app && python -m collectors.spotify_playlist_seeder >> /var/log/everywhere-chart/spotify_seeder.log 2>&1
+# NOTE: Spotify Playlist Seeder runs inline at the end of the Spotify collector
+# (above). No separate cron entry needed — it piggybacks on the Playwright
+# user token. To run standalone for testing:
+#   python -m collectors.spotify_playlist_seeder
 
 # ScrapeCreators TikTok + YouTube catalog enrichment — daily at 10:00 UTC
 # Processes up to 500 songs/day (2 credits each = 1000 credits/day)

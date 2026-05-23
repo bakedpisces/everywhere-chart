@@ -516,17 +516,6 @@ def run(snapshot_date: date = None):
     try:
         all_chart_rows, user_token = fetch_all_charts()
 
-        # Run playlist seeder while we have a valid user token
-        if user_token:
-            try:
-                from collectors.spotify_playlist_seeder import run as seed_playlists
-                log.info("Starting playlist seeder with user token from browser session")
-                seed_playlists(user_token=user_token, conn=conn)
-            except Exception as e:
-                log.warning(f"Playlist seeder failed (non-fatal): {e}")
-        else:
-            log.warning("No user token available — skipping playlist seeder")
-
         seen_spotify_ids: set[str] = set()  # dedupe songs appearing in multiple charts
 
         for chart in CHARTS_TO_FETCH:
@@ -622,6 +611,21 @@ def run(snapshot_date: date = None):
             f"Spotify collector complete — "
             f"{total_events} events written, {total_dropped} dropped"
         )
+
+        # ── Playlist seeder — runs after chart data is safely committed ───
+        # Needs the user-level token extracted from the Playwright session.
+        if user_token:
+            try:
+                from collectors.spotify_playlist_seeder import run as seed_playlists
+                log.info("Starting playlist seeder with user token from Playwright session")
+                seed_playlists(user_token=user_token, conn=conn)
+            except Exception as e:
+                log.warning(f"Playlist seeder failed (non-fatal): {e}")
+        else:
+            log.warning(
+                "No user token available — skipping playlist seeder. "
+                "Ensure SPOTIFY_SP_DC is set so the Playwright session can extract a token."
+            )
 
     except Exception as e:
         with conn.cursor() as cur:

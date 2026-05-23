@@ -6,19 +6,24 @@ Searches Spotify for playlists matching discovery keywords ("new",
 pulls their tracks, and upserts every song into the catalog.
 
 No signal_events are written — this is purely catalog seeding so that
-other collectors (Reddit, Shazam, YouTube, TikTok) can match against
-a much wider song universe.
+other collectors (Reddit, Shazam, YouTube, TikTok, ScrapeCreators) can
+match against a much wider song universe.
 
 Strategy:
   1. Search for each keyword (searches title + description)
-  2. Paginate up to 200 results per keyword
-  3. Keep playlists with followers >= MIN_FOLLOWERS
+  2. Paginate up to SEARCH_PAGES results per keyword
+  3. Batch-fetch full playlist objects (followers, name) — up to
+     FOLLOWER_FETCH_LIMIT per keyword to cap API calls
   4. Deduplicate playlists by Spotify playlist ID across keywords
   5. Fetch tracks from each qualifying playlist (up to TRACKS_PER_PLAYLIST)
+     — requires a user-level token; 403 is detected and logged clearly
   6. Upsert artist + song; pull full metadata for new songs
   7. Record seeded playlists in seeded_playlists table to skip on re-runs
 
-Schedule: daily at 07:00 UTC (before Spotify collector at 08:00)
+Called from spotify_collector.run() after chart data is written, with a
+user-level token extracted from the Playwright browser session.
+Can also run standalone (python -m collectors.spotify_playlist_seeder)
+using the sp_dc cookie or client credentials as fallback.
 """
 
 import os
@@ -37,13 +42,15 @@ log = logging.getLogger("spotify_playlist_seeder")
 DB_URL         = os.environ["DATABASE_URL"]
 SPOTIFY_CLIENT = os.environ.get("SPOTIFY_CLIENT_ID")
 SPOTIFY_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET")
-SPOTIFY_SP_DC  = os.environ.get("SPOTIFY_SP_DC")   # session cookie → user-level token
+SPOTIFY_SP_DC  = os.environ.get("SPOTIFY_SP_DC")
 
-SEARCH_KEYWORDS   = ["new", "hot", "hottest", "trending"]
-MIN_FOLLOWERS     = 50_000
-TRACKS_PER_PLAYLIST = 100   # max tracks pulled per playlist
-SEARCH_LIMIT      = 10      # results per search page (Spotify playlist search max is 10)
-SEARCH_PAGES      = 20      # pages per keyword → up to 200 results per keyword
+SEARCH_KEYWORDS      = ["new", "hot", "hottest", "trending"]
+MIN_FOLLOWERS        = 50_000
+TRACKS_PER_PLAYLIST  = 100
+SEARCH_LIMIT         = 10    # Spotify playlist search max per page
+SEARCH_PAGES         = 20    # pages per keyword → up to 200 candidates
+FOLLOWER_FETCH_LIMIT = 100   # cap full-playlist fetches per keyword to limit API calls
+MAX_PLAYLISTS_PER_RUN = 50   # cap total playlists seeded per run
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -66,20 +73,16 @@ _token_cache: dict = {}
 
 def get_token() -> Optional[str]:
     """
-    Get a Spotify access token.
-    First checks if an injected user token was provided (from Spotify collector's
-    Playwright session). Otherwise tries sp_dc cookie, then client credentials.
+    Priority:
+      1. Injected user token (from Spotify collector's Playwright session)
+      2. sp_dc session cookie → user-level token via web endpoint
+      3. Client credentials (can discover playlists but NOT read their tracks)
     """
     now = time.time()
     if _token_cache.get("expires_at", 0) > now + 30:
         return _token_cache["access_token"]
 
-    # Injected user token from Spotify collector's Playwright session (Option 2)
-    if _token_cache.get("injected_token"):
-        # Use it directly — treat as valid for 1 hour (it was just extracted)
-        return _token_cache["injected_token"]
-
-    # Try sp_dc first — gives user-level access needed for playlist tracks
+    # Try sp_dc
     if SPOTIFY_SP_DC:
         try:
             resp = requests.get(
@@ -104,9 +107,9 @@ def get_token() -> Optional[str]:
         except Exception as e:
             log.warning(f"sp_dc token failed: {e} — falling back to client credentials")
 
-    # Client credentials fallback (metadata only, can't read playlist tracks)
+    # Client credentials fallback
     if not SPOTIFY_CLIENT or not SPOTIFY_SECRET:
-        log.error("Missing SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET")
+        log.error("No SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET — cannot get token")
         return None
     try:
         resp = requests.post(
@@ -119,17 +122,26 @@ def get_token() -> Optional[str]:
         data = resp.json()
         _token_cache["access_token"] = data["access_token"]
         _token_cache["expires_at"]   = now + data["expires_in"]
-        log.info("Using client credentials token (playlist tracks may be 403)")
+        log.warning(
+            "Using client credentials token — playlist TRACK fetching will 403. "
+            "Provide SPOTIFY_SP_DC or inject a user token to seed tracks."
+        )
         return _token_cache["access_token"]
     except Exception as e:
         log.error(f"Spotify token error: {e}")
         return None
 
+
 def _get(url: str, params: dict = None) -> Optional[dict]:
-    """Authenticated GET with rate-limit handling."""
+    """
+    Authenticated GET with rate-limit handling.
+    Returns None on any error. 403 is logged distinctly (auth issue,
+    not retried) so callers can detect it via the log.
+    """
     token = get_token()
     if not token:
         return None
+
     for attempt in range(3):
         try:
             resp = requests.get(
@@ -147,90 +159,122 @@ def _get(url: str, params: dict = None) -> Optional[dict]:
                 injected = _token_cache.get("injected_token")
                 _token_cache.clear()
                 if injected:
-                    # Injected token expired mid-run; fall through to sp_dc/client-creds
                     log.warning("Injected user token returned 401 — falling back to client credentials")
                 token = get_token()
+                if not token:
+                    return None
                 continue
+            if resp.status_code == 403:
+                log.warning(
+                    f"403 Forbidden: {url[:80]} — "
+                    "token lacks permission (need user OAuth, not client credentials)"
+                )
+                return None   # don't retry — auth won't fix itself mid-run
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
-            log.warning(f"GET {url} attempt {attempt+1} failed: {e}")
+            log.warning(f"GET {url[:80]} attempt {attempt+1} failed: {e}")
             time.sleep(2)
     return None
+
+
+def _has_user_token() -> bool:
+    """True if current token is user-level (can read playlist tracks)."""
+    return bool(_token_cache.get("injected_token") or SPOTIFY_SP_DC)
+
 
 # ── Playlist discovery ────────────────────────────────────────────────────────
 
 def search_playlists(keyword: str) -> list[dict]:
     """
-    Search Spotify for playlists matching keyword (title + description).
-    Returns playlists with followers >= MIN_FOLLOWERS.
+    Search Spotify for playlists matching keyword.
+
+    Optimised: collects all candidate IDs from search pages first, then
+    batch-fetches full playlist objects (for accurate follower counts) only
+    up to FOLLOWER_FETCH_LIMIT — avoiding hundreds of individual API calls.
     """
-    found: dict[str, dict] = {}
+    # Phase 1: collect candidate playlist IDs from search pages
+    candidate_ids: list[str] = []
+    seen_ids: set[str] = set()
 
     for page in range(SEARCH_PAGES):
-        offset = page * SEARCH_LIMIT
         data = _get(
             "https://api.spotify.com/v1/search",
             params={
                 "q":      keyword,
                 "type":   "playlist",
                 "limit":  SEARCH_LIMIT,
-                "offset": offset,
+                "offset": page * SEARCH_LIMIT,
             },
         )
         if not data:
             break
 
-        items = data.get("playlists", {}).get("items", [])
+        items = data.get("playlists", {}).get("items", []) or []
         if not items:
             break
 
         for pl in items:
             if not pl or not pl.get("id"):
                 continue
+            pid = pl["id"]
+            if pid not in seen_ids:
+                seen_ids.add(pid)
+                # Quick check: if follower count is already present in search
+                # result and clearly too small, skip the full fetch
+                fl = (pl.get("followers") or {}).get("total", 0) or 0
+                if fl > 0 and fl < MIN_FOLLOWERS:
+                    continue
+                candidate_ids.append(pid)
 
-            followers = pl.get("followers", {}).get("total", 0)
-
-            # followers may be 0/null in search results — fetch full playlist
-            # only if it looks promising based on name/owner first
-            pl_id = pl["id"]
-            if pl_id in found:
-                continue
-
-            # Fetch full playlist object to get accurate follower count
-            full = _get(f"https://api.spotify.com/v1/playlists/{pl_id}",
-                        params={"fields": "id,name,description,followers,owner"})
-            if not full:
-                continue
-
-            followers = full.get("followers", {}).get("total", 0)
-            if followers < MIN_FOLLOWERS:
-                continue
-
-            found[pl_id] = {
-                "id":          pl_id,
-                "name":        full.get("name", ""),
-                "description": full.get("description", ""),
-                "followers":   followers,
-                "owner":       full.get("owner", {}).get("id", ""),
-            }
-            log.info(
-                f"  [{keyword}] '{full.get('name', '')}' "
-                f"by {full.get('owner', {}).get('display_name', '?')} "
-                f"— {followers:,} followers"
-            )
-            time.sleep(0.1)
-
-        # Stop paging if we got fewer results than the limit
         if len(items) < SEARCH_LIMIT:
             break
         time.sleep(0.2)
+
+    log.info(f"  [{keyword}] {len(candidate_ids)} candidates from search")
+
+    if not candidate_ids:
+        return []
+
+    # Phase 2: fetch full playlist objects for follower counts
+    # Cap to FOLLOWER_FETCH_LIMIT to avoid excessive API calls
+    to_fetch = candidate_ids[:FOLLOWER_FETCH_LIMIT]
+    found: dict[str, dict] = {}
+
+    for pl_id in to_fetch:
+        full = _get(
+            f"https://api.spotify.com/v1/playlists/{pl_id}",
+            params={"fields": "id,name,description,followers,owner"},
+        )
+        if not full:
+            time.sleep(0.1)
+            continue
+
+        followers = full.get("followers", {}).get("total", 0) or 0
+        if followers < MIN_FOLLOWERS:
+            time.sleep(0.1)
+            continue
+
+        found[pl_id] = {
+            "id":        pl_id,
+            "name":      full.get("name", ""),
+            "followers": followers,
+            "owner":     (full.get("owner") or {}).get("id", ""),
+        }
+        log.info(
+            f"  [{keyword}] '{full.get('name', '')}' "
+            f"({followers:,} followers) ✓"
+        )
+        time.sleep(0.1)
 
     return list(found.values())
 
 
 def fetch_playlist_tracks(playlist_id: str) -> list[dict]:
-    """Fetch up to TRACKS_PER_PLAYLIST tracks from a playlist."""
+    """
+    Fetch up to TRACKS_PER_PLAYLIST tracks.
+    Returns empty list on 403 (logged clearly by _get).
+    """
     tracks = []
     url    = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
     params = {
@@ -244,7 +288,7 @@ def fetch_playlist_tracks(playlist_id: str) -> list[dict]:
         if not data:
             break
 
-        for item in data.get("items", []):
+        for item in data.get("items", []) or []:
             track = item.get("track")
             if not track or not track.get("id"):
                 continue
@@ -252,18 +296,18 @@ def fetch_playlist_tracks(playlist_id: str) -> list[dict]:
             if not artists:
                 continue
             tracks.append({
-                "spotify_id":  track["id"],
-                "title":       track.get("name", "").strip(),
-                "artist":      artists[0].get("name", "").strip(),
-                "artist_id":   artists[0].get("id", ""),
-                "isrc":        track.get("external_ids", {}).get("isrc"),
+                "spotify_id":   track["id"],
+                "title":        track.get("name", "").strip(),
+                "artist":       artists[0].get("name", "").strip(),
+                "artist_id":    artists[0].get("id", ""),
+                "isrc":         track.get("external_ids", {}).get("isrc"),
                 "release_date": _normalize_release_date(
                     track.get("album", {}).get("release_date")
                 ),
             })
 
         url    = data.get("next")
-        params = None   # next URL already has params baked in
+        params = None
         time.sleep(0.1)
 
     return tracks[:TRACKS_PER_PLAYLIST]
@@ -277,19 +321,14 @@ def fetch_artist_genres(artist_spotify_id: str) -> list[str]:
 
 
 def upsert_track(cur, track: dict) -> Optional[str]:
-    """
-    Upsert artist + song. Returns song_id or None on error.
-    Fetches artist genres for new artists.
-    """
+    """Upsert artist + song. Returns song_id or None."""
     title_norm  = normalize(track["title"])
     artist_norm = normalize(track["artist"])
     if not title_norm or not artist_norm:
         return None
 
-    # ── Artist ────────────────────────────────────────────────────────────────
     artist_key = track["artist_id"] or f"unknown_{artist_norm}"
 
-    # Check if artist exists already
     cur.execute(
         "SELECT id, genre_tags FROM artists WHERE spotify_artist_id = %s",
         (artist_key,)
@@ -300,10 +339,8 @@ def upsert_track(cur, track: dict) -> Optional[str]:
         artist_id = str(existing_artist["id"])
         genres    = existing_artist["genre_tags"] or []
     else:
-        # New artist — fetch genres
         genres = fetch_artist_genres(track["artist_id"]) if track["artist_id"] else []
         time.sleep(0.1)
-
         cur.execute("""
             INSERT INTO artists (name, name_normalized, spotify_artist_id, genre_tags)
             VALUES (%s, %s, %s, %s)
@@ -326,7 +363,6 @@ def upsert_track(cur, track: dict) -> Optional[str]:
             )
             artist_id = str(cur.fetchone()["id"])
 
-    # ── Song ──────────────────────────────────────────────────────────────────
     cur.execute("""
         INSERT INTO songs (
             title, title_normalized, artist_id,
@@ -336,19 +372,13 @@ def upsert_track(cur, track: dict) -> Optional[str]:
         ON CONFLICT (spotify_track_id) DO NOTHING
         RETURNING id
     """, (
-        track["title"],
-        title_norm,
-        artist_id,
-        track["spotify_id"],
-        track["isrc"],
-        genres,
-        track["release_date"],
+        track["title"], title_norm, artist_id,
+        track["spotify_id"], track["isrc"], genres, track["release_date"],
     ))
     row = cur.fetchone()
     if row:
         return str(row["id"])
 
-    # Already existed
     cur.execute(
         "SELECT id FROM songs WHERE spotify_track_id = %s", (track["spotify_id"],)
     )
@@ -359,7 +389,6 @@ def upsert_track(cur, track: dict) -> Optional[str]:
 # ── Seeded-playlist tracking ──────────────────────────────────────────────────
 
 def ensure_seeded_playlists_table(conn):
-    """Create tracking table if it doesn't exist yet."""
     with conn.cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS seeded_playlists (
@@ -399,20 +428,21 @@ def run(user_token: Optional[str] = None, conn=None):
     """
     Main entry point.
 
-    When called from the Spotify collector (Option 2), pass:
-      - user_token: valid user-level Spotify access token extracted from
-                    the collector's Playwright browser session
-      - conn:       an open psycopg2 connection to reuse (not closed here)
+    When called from spotify_collector.run() (normal case):
+      - user_token: user-level token extracted from the Playwright browser
+      - conn:       existing DB connection (not closed here)
 
-    When run standalone, both default to None and are set up internally.
+    When run standalone (python -m collectors.spotify_playlist_seeder):
+      - Both default to None; connection and token acquired internally.
     """
-    # Inject user token so get_token() uses it immediately
+    # Inject user token so get_token() returns it immediately
     if user_token:
         _token_cache["injected_token"] = user_token
-        # Give it a generous TTL — it was just fetched
-        _token_cache["expires_at"] = time.time() + 3600
-        _token_cache["access_token"] = user_token
-        log.info("Playlist seeder using injected user token from Spotify collector")
+        _token_cache["access_token"]   = user_token
+        _token_cache["expires_at"]     = time.time() + 3600
+        log.info("Playlist seeder: using injected user token from Spotify collector")
+    else:
+        log.info("Playlist seeder: no injected token — will attempt sp_dc / client credentials")
 
     owns_conn = conn is None
     if owns_conn:
@@ -421,6 +451,14 @@ def run(user_token: Optional[str] = None, conn=None):
         psycopg2.extras.register_uuid()
 
     ensure_seeded_playlists_table(conn)
+
+    # Warn early if we probably can't read tracks
+    if not _has_user_token():
+        log.warning(
+            "No user-level token available. Playlist discovery will work but "
+            "track fetching will likely 403. To fix: ensure SPOTIFY_SP_DC is set "
+            "or the Spotify collector's Playwright session is providing a token."
+        )
 
     # ── Discover playlists ────────────────────────────────────────────────────
     all_playlists: dict[str, dict] = {}
@@ -432,28 +470,45 @@ def run(user_token: Optional[str] = None, conn=None):
         log.info(f"  '{keyword}': {len(results)} qualifying playlists found")
         time.sleep(0.5)
 
-    log.info(f"Total unique playlists to seed: {len(all_playlists)}")
+    log.info(f"Total unique qualifying playlists: {len(all_playlists)}")
+
+    # Sort by followers desc; cap to MAX_PLAYLISTS_PER_RUN
+    ranked = sorted(all_playlists.values(), key=lambda x: x["followers"], reverse=True)
+    ranked = ranked[:MAX_PLAYLISTS_PER_RUN]
+    log.info(f"Processing top {len(ranked)} playlists this run")
 
     # ── Seed tracks ───────────────────────────────────────────────────────────
     total_new     = 0
-    total_skipped = 0
     playlists_run = 0
+    first_403     = True   # flag to give a one-time clear explanation
 
-    for pl in sorted(all_playlists.values(), key=lambda x: x["followers"], reverse=True):
+    for pl in ranked:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             if already_seeded_today(cur, pl["id"]):
-                log.info(f"Skipping '{pl['name']}' — seeded recently")
+                log.info(f"Skipping '{pl['name']}' — seeded in last 23h")
                 continue
 
-        log.info(
-            f"Seeding '{pl['name']}' ({pl['followers']:,} followers) …"
-        )
+        log.info(f"Seeding '{pl['name']}' ({pl['followers']:,} followers) …")
         tracks = fetch_playlist_tracks(pl["id"])
+
         if not tracks:
-            log.warning(f"  No tracks returned for '{pl['name']}'")
+            if first_403:
+                log.warning(
+                    "No tracks returned. If you see 403 warnings above, the token "
+                    "doesn't have playlist read permission. Check that SPOTIFY_SP_DC "
+                    "is valid or that the Spotify collector is successfully injecting "
+                    "a user token."
+                )
+                first_403 = False
+            # Still mark as seeded so we don't hammer it on every run
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                mark_seeded(cur, pl, 0)
+            conn.commit()
             continue
 
+        first_403 = False  # at least one playlist returned tracks — token is working
         new_this_playlist = 0
+
         for track in tracks:
             if not track["title"] or not track["artist"] or not track["spotify_id"]:
                 continue
@@ -473,15 +528,15 @@ def run(user_token: Optional[str] = None, conn=None):
 
         total_new     += new_this_playlist
         playlists_run += 1
-        log.info(f"  ✓ {new_this_playlist} tracks upserted from '{pl['name']}'")
+        log.info(f"  ✓ {new_this_playlist} tracks upserted")
         time.sleep(0.5)
 
     if owns_conn:
         conn.close()
+
     log.info(
         f"Playlist seeder complete — "
-        f"{playlists_run} playlists, {total_new} songs upserted, "
-        f"{total_skipped} skipped"
+        f"{playlists_run} playlists processed, {total_new} songs upserted"
     )
 
 
