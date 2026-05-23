@@ -46,48 +46,69 @@ INTENTIONALITY_TIKTOK = 0.80
 
 # ── Chart fetch ───────────────────────────────────────────────────────────────
 
-def _fetch_region(page_request, auth_headers: dict, region: dict) -> list[dict]:
-    """Fetch up to 3 pages of rank_list for one region using pre-captured auth headers."""
-    all_items = []
-    for page_num in range(1, 4):
-        params = f"rank_type=popular&period=7&page={page_num}&limit=20&new_on_board=false&country_code={region['country_code']}"
-        try:
-            resp = page_request.get(
-                f"{API_LIST_URL}?{params}",
-                headers=auth_headers,
-                timeout=20_000,
+
+def _fetch_via_browser(page, country_code: str, page_num: int = 1) -> Optional[dict]:
+    """
+    Call the rank_list API from inside the browser using fetch() with
+    credentials:include — this automatically carries whatever cookies/headers
+    TikTok set during page load, bypassing the need to intercept requests.
+    """
+    url = (
+        f"{API_LIST_URL}"
+        f"?rank_type=popular&period=7&page={page_num}&limit=20"
+        f"&new_on_board=false&country_code={country_code}"
+    )
+    try:
+        result = page.evaluate(f"""
+            async () => {{
+                try {{
+                    const resp = await fetch("{url}", {{
+                        credentials: "include",
+                        headers: {{
+                            "Accept": "application/json, text/plain, */*",
+                        }}
+                    }});
+                    const data = await resp.json();
+                    return {{ status: resp.status, data: data }};
+                }} catch(e) {{
+                    return {{ error: e.toString() }};
+                }}
+            }}
+        """)
+        if not result:
+            return None
+        if result.get("error"):
+            log.warning(f"Browser fetch error for {country_code} p{page_num}: {result['error']}")
+            return None
+        if result.get("status") != 200:
+            log.warning(f"Browser fetch status {result.get('status')} for {country_code} p{page_num}")
+            return None
+        data = result.get("data", {})
+        if data.get("code") != 0:
+            log.warning(
+                f"rank_list API error for {country_code} p{page_num}: "
+                f"code={data.get('code')} msg={data.get('msg')}"
             )
-        except Exception as e:
-            log.warning(f"rank_list request failed p={page_num} {region['label']}: {e}")
-            break
-        if resp.status != 200:
-            log.warning(f"rank_list p={page_num} status={resp.status} for {region['label']}")
-            break
-        body = resp.json()
-        if not body.get("data"):
-            log.warning(f"rank_list p={page_num} code={body.get('code')} msg={body.get('msg')}")
-            break
-        items = body["data"].get("sound_list") or []
-        if not items:
-            break
-        all_items.extend(items)
-        log.info(f"  {region['label']} p={page_num}: {len(items)} tracks (total {len(all_items)})")
-        time.sleep(1)
-    return all_items
+            return None
+        return data
+    except Exception as e:
+        log.warning(f"_fetch_via_browser failed for {country_code} p{page_num}: {e}")
+        return None
 
 
 def fetch_all_regions() -> dict[str, list[dict]]:
     """
-    Launch ONE browser, try several country codes to capture auth headers,
-    then call rank_list for every region using those headers.
+    Launch ONE browser, load the Creative Center page to establish a valid
+    session, then call the rank_list API from within the browser context
+    using page.evaluate() + fetch(credentials:include).
+
+    This sidesteps the request-interception approach entirely — the browser
+    already has the right cookies from page load, so in-browser fetch()
+    calls are automatically authenticated.
+
     Returns {region_label: [rows]}.
     """
     from playwright.sync_api import sync_playwright
-
-    auth_headers = {}
-
-    # Try these country codes in order until one fires rank_list
-    WARMUP_CODES = ["AU", "GB", "US", "BR"]
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -100,89 +121,55 @@ def fetch_all_regions() -> dict[str, list[dict]]:
         )
         pg = context.new_page()
 
+        # Log all TikTok API calls for diagnostics (don't need to intercept now)
         def on_request(request):
             url = request.url
-            if "ads.tiktok.com" in url or "creative" in url.lower():
-                if "rank_list" in url or "sound" in url or "music" in url or "trend" in url:
-                    log.info(f"Intercepted API call: {url[:120]}")
-                    if "rank_list" in url:
-                        auth_headers.update(dict(request.headers))
-                        log.info("Captured rank_list auth headers")
+            if "ads.tiktok.com" in url and any(
+                k in url for k in ("rank_list", "sound", "music", "trend", "radar")
+            ):
+                log.info(f"[diag] TikTok API call: {url[:120]}")
 
         pg.on("request", on_request)
 
-        # Selectors that may trigger the rank_list API call
-        MUSIC_SELECTORS = [
-            "text=Music",
-            "[class*='music']",
-            "[class*='Music']",
-            "[data-e2e*='music']",
-            "li:has-text('Music')",
-            "a:has-text('Music')",
-            "[class*='tab']:has-text('Music')",
-        ]
-
         try:
-            for warmup_code in WARMUP_CODES:
-                if auth_headers:
-                    break
+            # Load the music page to establish session cookies
+            log.info("Loading Creative Center music page to establish session …")
+            try:
+                pg.goto(
+                    f"{CREATIVE_CENTER_URL}?country_code=US",
+                    wait_until="networkidle",
+                    timeout=60_000,
+                )
+                pg.wait_for_timeout(3_000)
+            except Exception as e:
+                log.warning(f"Page load warning (continuing anyway): {e}")
 
-                log.info(f"Trying warmup page: {warmup_code}")
-                try:
-                    pg.goto(
-                        f"{CREATIVE_CENTER_URL}?country_code={warmup_code}",
-                        wait_until="networkidle",
-                        timeout=60_000,
-                    )
-                    pg.wait_for_timeout(3_000)
-
-                    if auth_headers:
-                        break
-
-                    # Try clicking Music tab selectors to trigger rank_list
-                    for sel in MUSIC_SELECTORS:
-                        if auth_headers:
-                            break
-                        try:
-                            el = pg.locator(sel).first
-                            if el.count() > 0:
-                                el.click(timeout=3_000)
-                                log.info(f"Clicked '{sel}' on {warmup_code}")
-                                pg.wait_for_timeout(3_000)
-                        except Exception:
-                            pass
-
-                    if auth_headers:
-                        break
-
-                    # Fallback: scroll progressively
-                    for scroll_y in [400, 800, 1200]:
-                        pg.mouse.wheel(0, scroll_y)
-                        pg.wait_for_timeout(2_000)
-                        if auth_headers:
-                            break
-
-                    pg.wait_for_timeout(3_000)
-
-                except Exception as e:
-                    log.warning(f"Warmup page {warmup_code} failed: {e}")
-
-            if not auth_headers:
-                log.warning("rank_list never fired on any warmup page — no auth headers")
-                return {}
-
-            log.info(f"Auth headers captured — fetching {len(REGIONS)} regions")
+            # Now call the API from inside the browser for each region
             results = {}
             for region in REGIONS:
-                items = _fetch_region(pg.request, auth_headers, region)
-                if items:
-                    results[region["label"]] = [
-                        {"rank": i + 1, **item, "region": region["label"]}
-                        for i, item in enumerate(items)
+                cc    = region["country_code"]
+                label = region["label"]
+                all_items: list[dict] = []
+
+                for page_num in range(1, 4):
+                    data = _fetch_via_browser(pg, cc, page_num)
+                    if not data:
+                        break
+                    items = data.get("data", {}).get("sound_list") or []
+                    if not items:
+                        break
+                    all_items.extend(items)
+                    log.info(f"  {label} p{page_num}: {len(items)} tracks (total {len(all_items)})")
+                    time.sleep(1)
+
+                if all_items:
+                    results[label] = [
+                        {"rank": i + 1, **item, "region": label}
+                        for i, item in enumerate(all_items)
                     ]
-                    log.info(f"  {region['label']}: {len(items)} total tracks")
+                    log.info(f"  {label}: {len(all_items)} total tracks ✓")
                 else:
-                    log.warning(f"  {region['label']}: no tracks returned")
+                    log.warning(f"  {label}: no tracks returned")
                 time.sleep(2)
 
             return results
