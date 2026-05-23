@@ -44,13 +44,19 @@ SPOTIFY_CLIENT = os.environ.get("SPOTIFY_CLIENT_ID")
 SPOTIFY_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET")
 SPOTIFY_SP_DC  = os.environ.get("SPOTIFY_SP_DC")
 
-SEARCH_KEYWORDS      = ["new", "hot", "hottest", "trending"]
-MIN_FOLLOWERS        = 50_000
-TRACKS_PER_PLAYLIST  = 100
-SEARCH_LIMIT         = 10    # Spotify playlist search max per page
-SEARCH_PAGES         = 20    # pages per keyword → up to 200 candidates
-FOLLOWER_FETCH_LIMIT = 100   # cap full-playlist fetches per keyword to limit API calls
-MAX_PLAYLISTS_PER_RUN = 50   # cap total playlists seeded per run
+SEARCH_KEYWORDS       = ["new", "hot", "hottest", "trending"]
+MIN_FOLLOWERS         = 50_000
+TRACKS_PER_PLAYLIST   = 100
+SEARCH_LIMIT          = 10    # Spotify playlist search max per page
+SEARCH_PAGES          = 20    # pages per keyword → up to 200 candidates
+FOLLOWER_FETCH_LIMIT  = 100   # cap full-playlist fetches per keyword to limit API calls
+MAX_PLAYLISTS_PER_RUN = 50    # cap total playlists seeded per run
+
+# Spotify user IDs that own editorial / official playlists
+EDITORIAL_OWNERS = {"spotify", "spotifycharts"}
+
+# Songs released within this window are considered "new"
+UNDER_RADAR_RELEASE_DAYS = 60
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -388,7 +394,8 @@ def upsert_track(cur, track: dict) -> Optional[str]:
 
 # ── Seeded-playlist tracking ──────────────────────────────────────────────────
 
-def ensure_seeded_playlists_table(conn):
+def ensure_tables(conn):
+    """Create tracking tables and song columns if they don't exist yet."""
     with conn.cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS seeded_playlists (
@@ -399,6 +406,110 @@ def ensure_seeded_playlists_table(conn):
                 tracks_added  INTEGER DEFAULT 0
             )
         """)
+        # Junction table: which songs have been seen in which playlists
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS song_playlist_memberships (
+                song_id       UUID  NOT NULL REFERENCES songs(id) ON DELETE CASCADE,
+                playlist_id   TEXT  NOT NULL,
+                is_editorial  BOOLEAN NOT NULL DEFAULT FALSE,
+                followers     INTEGER NOT NULL DEFAULT 0,
+                first_seen_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (song_id, playlist_id)
+            )
+        """)
+        # New columns on songs (safe to run repeatedly)
+        cur.execute("""
+            ALTER TABLE songs
+                ADD COLUMN IF NOT EXISTS playlist_follower_count BIGINT  DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS under_radar             BOOLEAN DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS under_radar_since       TIMESTAMPTZ
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS songs_release_date_idx
+                ON songs (release_date DESC NULLS LAST)
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS songs_under_radar_idx
+                ON songs (under_radar) WHERE under_radar = TRUE
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS spm_song_idx
+                ON song_playlist_memberships (song_id)
+        """)
+    conn.commit()
+
+
+def record_membership(cur, song_id: str, playlist: dict, is_editorial: bool):
+    """
+    Insert a song→playlist membership if it doesn't exist.
+    On first insert, add the playlist's follower count to the song's running total.
+    ON CONFLICT DO NOTHING ensures re-runs don't double-count.
+    """
+    cur.execute("""
+        INSERT INTO song_playlist_memberships
+            (song_id, playlist_id, is_editorial, followers)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (song_id, playlist_id) DO NOTHING
+    """, (song_id, playlist["id"], is_editorial, playlist["followers"]))
+
+    # Only add to follower count if this was a genuinely new membership row
+    if cur.rowcount > 0:
+        cur.execute("""
+            UPDATE songs
+            SET playlist_follower_count = COALESCE(playlist_follower_count, 0) + %s
+            WHERE id = %s
+        """, (playlist["followers"], song_id))
+
+
+def refresh_under_radar(conn):
+    """
+    Update the under_radar flag after all playlists are seeded.
+
+    A song is "under the radar" when:
+      - Released within UNDER_RADAR_RELEASE_DAYS days
+      - On at least one user-generated (non-editorial) playlist
+      - Not yet appearing on any Spotify chart (no spotify/chart_position signal)
+
+    The flag is cleared when a song makes it onto a Spotify chart.
+    """
+    with conn.cursor() as cur:
+        # Set flag for qualifying songs
+        cur.execute(f"""
+            UPDATE songs SET
+                under_radar       = TRUE,
+                under_radar_since = COALESCE(under_radar_since, NOW())
+            WHERE
+                release_date >= NOW() - INTERVAL '{UNDER_RADAR_RELEASE_DAYS} days'
+                AND id IN (
+                    SELECT DISTINCT song_id
+                    FROM song_playlist_memberships
+                    WHERE is_editorial = FALSE
+                )
+                AND id NOT IN (
+                    SELECT DISTINCT song_id
+                    FROM signal_events
+                    WHERE source_platform = 'spotify'
+                      AND signal_type     = 'chart_position'
+                )
+        """)
+        flagged = cur.rowcount
+        log.info(f"Under-radar: {flagged} songs newly/still flagged")
+
+        # Clear flag for songs that have since made a Spotify chart
+        cur.execute("""
+            UPDATE songs SET under_radar = FALSE
+            WHERE under_radar = TRUE
+              AND id IN (
+                  SELECT DISTINCT song_id
+                  FROM signal_events
+                  WHERE source_platform = 'spotify'
+                    AND signal_type     = 'chart_position'
+              )
+        """)
+        cleared = cur.rowcount
+        if cleared:
+            log.info(f"Under-radar: {cleared} songs cleared (now on Spotify chart)")
+
     conn.commit()
 
 
@@ -450,7 +561,7 @@ def run(user_token: Optional[str] = None, conn=None):
         conn.autocommit = False
         psycopg2.extras.register_uuid()
 
-    ensure_seeded_playlists_table(conn)
+    ensure_tables(conn)
 
     # Warn early if we probably can't read tracks
     if not _has_user_token():
@@ -483,12 +594,15 @@ def run(user_token: Optional[str] = None, conn=None):
     first_403     = True   # flag to give a one-time clear explanation
 
     for pl in ranked:
+        is_editorial = pl["owner"] in EDITORIAL_OWNERS
+
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             if already_seeded_today(cur, pl["id"]):
                 log.info(f"Skipping '{pl['name']}' — seeded in last 23h")
                 continue
 
-        log.info(f"Seeding '{pl['name']}' ({pl['followers']:,} followers) …")
+        source_tag = "editorial" if is_editorial else "UGC"
+        log.info(f"Seeding '{pl['name']}' ({pl['followers']:,} followers) [{source_tag}] …")
         tracks = fetch_playlist_tracks(pl["id"])
 
         if not tracks:
@@ -516,6 +630,7 @@ def run(user_token: Optional[str] = None, conn=None):
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     song_id = upsert_track(cur, track)
                     if song_id:
+                        record_membership(cur, song_id, pl, is_editorial)
                         new_this_playlist += 1
                 conn.commit()
             except Exception as e:
@@ -528,8 +643,11 @@ def run(user_token: Optional[str] = None, conn=None):
 
         total_new     += new_this_playlist
         playlists_run += 1
-        log.info(f"  ✓ {new_this_playlist} tracks upserted")
+        log.info(f"  ✓ {new_this_playlist} tracks upserted [{source_tag}]")
         time.sleep(0.5)
+
+    # ── Update under-radar flags ──────────────────────────────────────────────
+    refresh_under_radar(conn)
 
     if owns_conn:
         conn.close()

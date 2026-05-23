@@ -261,8 +261,13 @@ def _check_fatal(resp: requests.Response, context: str):
 
 def load_songs(cur, limit: int) -> list[dict]:
     """
-    Songs that haven't had any ScrapeCreators lookup (sc_ prefix on either
-    platform) in the last RECHECK_DAYS days. Chart songs come first.
+    Songs that haven't had any ScrapeCreators lookup in the last RECHECK_DAYS.
+
+    Priority order:
+      1. Under-radar songs (new + UGC playlist + not on Spotify chart)
+      2. Top songs — on a Spotify or Shazam chart right now
+      3. Everything else (catalog songs with some signals, or none)
+         sorted by playlist follower count so the most-playlisted come first
     """
     cur.execute(f"""
         WITH last_sc AS (
@@ -270,6 +275,13 @@ def load_songs(cur, limit: int) -> list[dict]:
             FROM signal_events
             WHERE external_id LIKE 'sc_%%'
             GROUP BY song_id
+        ),
+        on_chart AS (
+            SELECT DISTINCT song_id
+            FROM signal_events
+            WHERE source_platform IN ('spotify', 'shazam')
+              AND signal_type = 'chart_position'
+              AND observed_at >= NOW() - INTERVAL '14 days'
         )
         SELECT
             s.id              AS song_id,
@@ -277,16 +289,21 @@ def load_songs(cur, limit: int) -> list[dict]:
             s.title_normalized,
             a.name            AS artist,
             a.name_normalized AS artist_normalized,
-            EXISTS (
-                SELECT 1 FROM signal_events se
-                WHERE se.song_id = s.id
-            ) AS has_signal
+            s.under_radar,
+            s.release_date,
+            s.playlist_follower_count,
+            (oc.song_id IS NOT NULL) AS on_chart
         FROM songs s
         JOIN artists a ON a.id = s.artist_id
         LEFT JOIN last_sc lc ON lc.song_id = s.id
+        LEFT JOIN on_chart oc ON oc.song_id = s.id
         WHERE lc.song_id IS NULL
            OR lc.last_at < NOW() - INTERVAL '{RECHECK_DAYS} days'
-        ORDER BY has_signal DESC, s.created_at DESC
+        ORDER BY
+            s.under_radar DESC,                          -- tier 1: under-radar
+            (oc.song_id IS NOT NULL) DESC,               -- tier 2: charting songs
+            s.playlist_follower_count DESC NULLS LAST,   -- tier 3: by playlist reach
+            s.created_at DESC
         LIMIT %s
     """, (limit,))
     return cur.fetchall()
