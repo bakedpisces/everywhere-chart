@@ -1,22 +1,26 @@
 """
-ScrapeCreators TikTok Usage Collector
---------------------------------------
-For songs in the catalog, queries TikTok via the ScrapeCreators API to find
-the official sound for each song and record how many TikTok videos use it.
+ScrapeCreators Catalog Enrichment Collector
+--------------------------------------------
+For songs in the catalog, queries TikTok and YouTube via ScrapeCreators to
+fill in signals for songs that aren't in the top-200 trending charts.
 
-This supplements the TikTok Creative Center collector by covering the full
-catalog — not just top-200 trending songs. Every song seeded from Spotify
-playlists, Shazam charts, or YouTube can now get a TikTok sound-use signal.
+Per song, two lookups are made (2 credits total):
+  1. TikTok — keyword search → find official sound → record user_count
+     (# TikTok videos created using that sound)
+     signal: source_platform='tiktok', signal_type='sound_use'
 
-Strategy:
-  1. Pull up to MAX_SONGS songs that haven't been looked up recently,
-     prioritising songs that already have at least one signal (they matter)
-  2. For each song: search "{title} {artist}" on ScrapeCreators keyword search
-  3. Among results, find the sound whose title/author best matches the song
-  4. Record the sound's user_count as a signal_event (source_platform='tiktok',
-     signal_type='sound_use') — same schema as the TikTok Creative Center data
+  2. YouTube — video search → find official video → record viewCountInt
+     (cumulative view count; tracked daily to measure growth over time)
+     signal: source_platform='youtube', signal_type='chart_position'
 
-Schedule: daily at 10:00 UTC  (after Spotify seeder at 07:00, Spotify chart at 08:00)
+Both use the same schema as their respective chart collectors, so dashboard
+scoring works identically. external_id is prefixed with 'sc_' to distinguish
+ScrapeCreators-sourced signals from chart-scraped ones.
+
+Priority: songs already on some chart come first (most likely to match).
+Rechecked every RECHECK_DAYS days — daily runs build a view-count time series.
+
+Schedule: daily at 10:00 UTC
 """
 
 import math
@@ -37,17 +41,28 @@ DB_URL     = os.environ["DATABASE_URL"]
 SC_API_KEY = os.environ.get("SCRAPECREATORS_API_KEY", "")
 SC_BASE    = "https://api.scrapecreators.com"
 
-MAX_SONGS       = 1000   # credit budget per run
-RECHECK_DAYS    = 7      # skip songs searched within this window
-MIN_USER_COUNT  = 10     # ignore sounds with fewer videos (noise)
-MATCH_THRESHOLD = 0.40   # minimum token-overlap score to accept a sound
+MAX_SONGS           = 500    # songs per run (2 credits each = 1000 credits/day)
+RECHECK_DAYS        = 7      # reprocess songs after this many days
+MIN_TT_USER_COUNT   = 10     # ignore TikTok sounds with fewer videos
+TT_MATCH_THRESHOLD  = 0.40   # token-overlap score to accept a TikTok sound
+YT_MATCH_THRESHOLD  = 0.35   # slightly looser — video titles have more noise
 
-INTENTIONALITY  = 0.80   # matches TikTok Creative Center collector
+INTENTIONALITY_TT   = 0.80   # matches TikTok Creative Center collector
+INTENTIONALITY_YT   = 0.20   # matches YouTube chart collector
 
-CHART_NAME      = "tiktok_sound_usage"   # stored in context_snapshot
+# Noise words to strip when classifying YouTube videos
+_YT_OFFICIAL = re.compile(
+    r"\b(official\s*(music\s*)?video|official\s*audio|official\s*lyric|"
+    r"lyric\s*video|lyrics|audio|visualizer|mv|hd|4k)\b",
+    re.IGNORECASE,
+)
+_YT_SKIP = re.compile(
+    r"\b(cover|covers|covered|reaction|reacts|tutorial|karaoke|"
+    r"instrumental|nightcore|remix|slowed|sped\s*up|reverb|parody)\b",
+    re.IGNORECASE,
+)
 
-
-# ── Normalisation helpers ─────────────────────────────────────────────────────
+# ── Shared normalisation ──────────────────────────────────────────────────────
 
 _NOISE = re.compile(
     r"\b(official|video|audio|lyrics?|hd|4k|mv|music|feat\.?|ft\.?|"
@@ -65,71 +80,53 @@ def _norm(s: str) -> str:
 
 
 def _tokens(s: str) -> set[str]:
-    return set(t for t in _norm(s).split() if len(t) > 1)
+    return {t for t in _norm(s).split() if len(t) > 1}
 
 
-def match_score(catalog_title: str, catalog_artist: str,
-                sound_title: str, sound_author: str) -> float:
-    """
-    Returns a 0–1 score: 60% title-token overlap + 40% artist-token overlap.
-    Returns 0 if no title tokens overlap (mandatory).
-    """
-    ct = _tokens(catalog_title)
-    st = _tokens(sound_title)
-    if not ct or not st:
+def _overlap(a: set, b: set) -> float:
+    if not a or not b:
         return 0.0
+    return len(a & b) / max(len(a), len(b))
 
-    title_overlap = len(ct & st) / max(len(ct), len(st))
-    if title_overlap == 0:
+
+# ── TikTok helpers ────────────────────────────────────────────────────────────
+
+def tt_match_score(catalog_title: str, catalog_artist: str,
+                   sound_title: str, sound_author: str) -> float:
+    """60% title overlap + 40% artist overlap. Returns 0 if no title overlap."""
+    title_score = _overlap(_tokens(catalog_title), _tokens(sound_title))
+    if title_score == 0:
         return 0.0
-
-    ca = _tokens(catalog_artist)
-    sa = _tokens(sound_author)
-    artist_overlap = len(ca & sa) / max(len(ca), len(sa)) if ca and sa else 0.0
-
-    return 0.6 * title_overlap + 0.4 * artist_overlap
+    artist_score = _overlap(_tokens(catalog_artist), _tokens(sound_author))
+    return 0.6 * title_score + 0.4 * artist_score
 
 
-# ── ScrapeCreators API ────────────────────────────────────────────────────────
-
-def search_sounds(title: str, artist: str) -> list[dict]:
+def search_tiktok_sounds(title: str, artist: str) -> list[dict]:
     """
     Search TikTok for '{title} {artist}', return deduplicated sounds sorted
-    by user_count descending.
-    Raises RuntimeError('out_of_credits') or RuntimeError('invalid_api_key')
-    on fatal API errors.
+    by user_count descending. Raises RuntimeError on fatal API errors.
     """
-    query = f"{title} {artist}"
     try:
         resp = requests.get(
             f"{SC_BASE}/v1/tiktok/search/keyword",
-            params={"query": query},
+            params={"query": f"{title} {artist}"},
             headers={"x-api-key": SC_API_KEY},
             timeout=20,
         )
-        if resp.status_code == 402:
-            log.error("ScrapeCreators: out of credits (402). Stopping run.")
-            raise RuntimeError("out_of_credits")
-        if resp.status_code == 401:
-            log.error("ScrapeCreators: invalid API key (401).")
-            raise RuntimeError("invalid_api_key")
+        _check_fatal(resp, "TikTok search")
         if not resp.ok:
-            log.warning(f"ScrapeCreators search failed ({resp.status_code}) for '{query}'")
+            log.warning(f"TikTok search failed ({resp.status_code}) for '{title}'")
             return []
 
-        # parse_constant=None avoids float precision loss on large TikTok IDs
-        data = resp.json()
-        items = data.get("search_item_list", [])
-
+        items = resp.json().get("search_item_list", [])
         seen: dict[str, dict] = {}
         for item in items:
             music = item.get("aweme_info", {}).get("music", {})
-            # IDs may lose precision as floats — convert through string
-            mid = str(int(float(str(music.get("id", 0))))) if music.get("id") else ""
+            mid   = str(music.get("id", "")) if music.get("id") else ""
             if not mid or mid in seen:
                 continue
             uc = int(music.get("user_count", 0))
-            if uc < MIN_USER_COUNT:
+            if uc < MIN_TT_USER_COUNT:
                 continue
             seen[mid] = {
                 "sound_id":   mid,
@@ -137,50 +134,149 @@ def search_sounds(title: str, artist: str) -> list[dict]:
                 "author":     music.get("author", ""),
                 "user_count": uc,
             }
-
         return sorted(seen.values(), key=lambda x: x["user_count"], reverse=True)
 
     except RuntimeError:
         raise
     except Exception as e:
-        log.warning(f"ScrapeCreators error for '{query}': {e}")
+        log.warning(f"TikTok search error for '{title}': {e}")
         return []
 
 
-def find_best_sound(title: str, artist: str,
-                    sounds: list[dict]) -> Optional[dict]:
-    """Pick the best-matching sound or None if nothing clears MATCH_THRESHOLD."""
+def find_best_sound(title: str, artist: str, sounds: list[dict]) -> Optional[dict]:
     best, best_score = None, 0.0
-    for sound in sounds:
-        score = match_score(title, artist, sound["title"], sound["author"])
+    for s in sounds:
+        score = tt_match_score(title, artist, s["title"], s["author"])
         if score > best_score:
-            best_score, best = score, sound
-    if best and best_score >= MATCH_THRESHOLD:
-        return best
-    return None
+            best_score, best = score, s
+    return best if best and best_score >= TT_MATCH_THRESHOLD else None
+
+
+# ── YouTube helpers ───────────────────────────────────────────────────────────
+
+def yt_match_score(catalog_title: str, catalog_artist: str,
+                   video_title: str, channel_name: str) -> float:
+    """
+    Score a YouTube video against the catalog entry.
+    Title overlap is mandatory. Boosts for artist-in-channel match.
+    Penalises covers, reactions, remixes.
+    """
+    if _YT_SKIP.search(video_title):
+        return 0.0
+
+    title_score = _overlap(_tokens(catalog_title), _tokens(video_title))
+    if title_score == 0:
+        return 0.0
+
+    artist_score = _overlap(_tokens(catalog_artist), _tokens(channel_name))
+    return 0.6 * title_score + 0.4 * artist_score
+
+
+def search_youtube_video(title: str, artist: str) -> Optional[dict]:
+    """
+    Search YouTube for '{title} {artist}', return the best-matching video
+    with its view count, or None if nothing clears YT_MATCH_THRESHOLD.
+    Prefers official music videos / official audio over lyric videos.
+    """
+    try:
+        resp = requests.get(
+            f"{SC_BASE}/v1/youtube/search",
+            params={"query": f"{title} {artist}"},
+            headers={"x-api-key": SC_API_KEY},
+            timeout=20,
+        )
+        _check_fatal(resp, "YouTube search")
+        if not resp.ok:
+            log.warning(f"YouTube search failed ({resp.status_code}) for '{title}'")
+            return None
+
+        videos = resp.json().get("videos", [])
+        if not videos:
+            return None
+
+        ct = _tokens(catalog_title := title)
+        ca = _tokens(catalog_artist := artist)
+
+        best, best_score, best_tier = None, 0.0, 99
+
+        for v in videos:
+            vt    = v.get("title", "")
+            ch    = v.get("channel", {}).get("title", "")
+            views = v.get("viewCountInt") or 0
+
+            score = yt_match_score(title, artist, vt, ch)
+            if score < YT_MATCH_THRESHOLD:
+                continue
+
+            # Tier: 0=official MV, 1=official audio, 2=lyric video, 3=other
+            vt_lo = vt.lower()
+            if "official music video" in vt_lo or ("official" in vt_lo and "video" in vt_lo):
+                tier = 0
+            elif "official audio" in vt_lo or "official" in vt_lo:
+                tier = 1
+            elif "lyric" in vt_lo:
+                tier = 2
+            else:
+                tier = 3
+
+            # Pick by: best tier first, then highest score, then most views
+            if (tier < best_tier or
+                    (tier == best_tier and score > best_score) or
+                    (tier == best_tier and score == best_score and views > (best["viewCountInt"] or 0) if best else False)):
+                best_tier  = tier
+                best_score = score
+                best       = v
+
+        if not best:
+            return None
+
+        return {
+            "video_id":   best.get("id", ""),
+            "title":      best.get("title", ""),
+            "channel":    best.get("channel", {}).get("title", ""),
+            "view_count": best.get("viewCountInt") or 0,
+            "url":        best.get("url", ""),
+            "published":  best.get("publishedTimeText", ""),
+        }
+
+    except RuntimeError:
+        raise
+    except Exception as e:
+        log.warning(f"YouTube search error for '{title}': {e}")
+        return None
+
+
+# ── API error handling ────────────────────────────────────────────────────────
+
+def _check_fatal(resp: requests.Response, context: str):
+    if resp.status_code == 402:
+        log.error(f"ScrapeCreators: out of credits (402) during {context}. Stopping.")
+        raise RuntimeError("out_of_credits")
+    if resp.status_code == 401:
+        log.error(f"ScrapeCreators: invalid API key (401) during {context}.")
+        raise RuntimeError("invalid_api_key")
 
 
 # ── Database helpers ──────────────────────────────────────────────────────────
 
 def load_songs(cur, limit: int) -> list[dict]:
     """
-    Fetch up to `limit` songs that haven't had a ScrapeCreators lookup in
-    the last RECHECK_DAYS days. Songs already on some chart come first.
+    Songs that haven't had any ScrapeCreators lookup (sc_ prefix on either
+    platform) in the last RECHECK_DAYS days. Chart songs come first.
     """
     cur.execute(f"""
         WITH last_sc AS (
             SELECT song_id, MAX(observed_at) AS last_at
             FROM signal_events
-            WHERE source_platform = 'tiktok'
-              AND external_id     LIKE 'sc_%%'
+            WHERE external_id LIKE 'sc_%%'
             GROUP BY song_id
         )
         SELECT
-            s.id               AS song_id,
+            s.id              AS song_id,
             s.title,
             s.title_normalized,
-            a.name             AS artist,
-            a.name_normalized  AS artist_normalized,
+            a.name            AS artist,
+            a.name_normalized AS artist_normalized,
             EXISTS (
                 SELECT 1 FROM signal_events se
                 WHERE se.song_id = s.id
@@ -196,39 +292,27 @@ def load_songs(cur, limit: int) -> list[dict]:
     return cur.fetchall()
 
 
-def write_signal(cur, song_id: str, sound: dict, now: datetime):
-    """Write a tiktok / sound_use signal for a matched sound."""
-    usage = sound["user_count"]
-    # Same engagement_multiplier formula as TikTok Creative Center collector
+def write_tiktok_signal(cur, song_id: str, sound: dict, now: datetime):
+    usage    = sound["user_count"]
     eng_mult = round(min(2.5, 1 + math.log10(max(usage, 1)) / 6), 3)
-    weighted = round(INTENTIONALITY * eng_mult, 4)
-
+    weighted = round(INTENTIONALITY_TT * eng_mult, 4)
     cur.execute("""
         INSERT INTO signal_events (
-            observed_at, song_id,
-            source_platform, signal_type,
-            intentionality_score,
-            raw_engagement, engagement_multiplier, weighted_score,
-            resolution_confidence, is_home_community,
+            observed_at, song_id, source_platform, signal_type,
+            intentionality_score, raw_engagement, engagement_multiplier,
+            weighted_score, resolution_confidence, is_home_community,
             external_id, context_snapshot
-        )
-        VALUES (%s, %s,
-                'tiktok', 'sound_use',
-                %s,
-                %s, %s, %s,
-                1.0, FALSE,
-                %s, %s)
+        ) VALUES (%s, %s, 'tiktok', 'sound_use',
+                  %s, %s, %s, %s, 1.0, FALSE, %s, %s)
         ON CONFLICT DO NOTHING
     """, (
-        now,
-        song_id,
-        INTENTIONALITY,
+        now, song_id,
+        INTENTIONALITY_TT,
         psycopg2.extras.Json({"usage_count": usage}),
-        eng_mult,
-        weighted,
-        f"sc_{sound['sound_id']}",   # prefix so we can filter SC lookups
+        eng_mult, weighted,
+        f"sc_{sound['sound_id']}",
         psycopg2.extras.Json({
-            "chart_name":   CHART_NAME,
+            "source":       "scrapecreators",
             "sound_id":     sound["sound_id"],
             "sound_title":  sound["title"],
             "sound_author": sound["author"],
@@ -237,29 +321,69 @@ def write_signal(cur, song_id: str, sound: dict, now: datetime):
     ))
 
 
-def write_no_match(cur, song_id: str, now: datetime):
-    """Sentinel row so we skip this song for RECHECK_DAYS even with no match."""
+def write_tiktok_no_match(cur, song_id: str, now: datetime):
     cur.execute("""
         INSERT INTO signal_events (
-            observed_at, song_id,
-            source_platform, signal_type,
-            intentionality_score,
-            raw_engagement, engagement_multiplier, weighted_score,
-            resolution_confidence, is_home_community,
+            observed_at, song_id, source_platform, signal_type,
+            intentionality_score, raw_engagement, engagement_multiplier,
+            weighted_score, resolution_confidence, is_home_community,
             external_id, context_snapshot
-        )
-        VALUES (%s, %s,
-                'tiktok', 'sound_use',
-                0.0,
-                %s, 1.0, 0.0,
-                0.0, FALSE,
-                'sc_no_match', %s)
+        ) VALUES (%s, %s, 'tiktok', 'sound_use',
+                  0.0, %s, 1.0, 0.0, 0.0, FALSE, 'sc_tt_no_match', %s)
         ON CONFLICT DO NOTHING
     """, (
-        now,
-        song_id,
+        now, song_id,
         psycopg2.extras.Json({"usage_count": 0}),
-        psycopg2.extras.Json({"chart_name": CHART_NAME, "result": "no_match"}),
+        psycopg2.extras.Json({"source": "scrapecreators", "result": "no_match"}),
+    ))
+
+
+def write_youtube_signal(cur, song_id: str, video: dict, now: datetime):
+    views    = video["view_count"]
+    # Log-scale multiplier: 1M views → ~1.67, 100M → ~1.89, 1B → ~2.0
+    eng_mult = round(min(2.5, 1 + math.log10(max(views, 1)) / 9), 3)
+    weighted = round(INTENTIONALITY_YT * eng_mult, 4)
+    cur.execute("""
+        INSERT INTO signal_events (
+            observed_at, song_id, source_platform, signal_type,
+            intentionality_score, raw_engagement, engagement_multiplier,
+            weighted_score, resolution_confidence, is_home_community,
+            external_id, external_url, context_snapshot
+        ) VALUES (%s, %s, 'youtube', 'chart_position',
+                  %s, %s, %s, %s, 1.0, FALSE, %s, %s, %s)
+        ON CONFLICT DO NOTHING
+    """, (
+        now, song_id,
+        INTENTIONALITY_YT,
+        psycopg2.extras.Json({"view_count": views}),
+        eng_mult, weighted,
+        f"sc_yt_{video['video_id']}",
+        video["url"],
+        psycopg2.extras.Json({
+            "source":      "scrapecreators",
+            "video_id":    video["video_id"],
+            "video_title": video["title"],
+            "channel":     video["channel"],
+            "view_count":  views,
+            "published":   video["published"],
+        }),
+    ))
+
+
+def write_youtube_no_match(cur, song_id: str, now: datetime):
+    cur.execute("""
+        INSERT INTO signal_events (
+            observed_at, song_id, source_platform, signal_type,
+            intentionality_score, raw_engagement, engagement_multiplier,
+            weighted_score, resolution_confidence, is_home_community,
+            external_id, context_snapshot
+        ) VALUES (%s, %s, 'youtube', 'chart_position',
+                  0.0, %s, 1.0, 0.0, 0.0, FALSE, 'sc_yt_no_match', %s)
+        ON CONFLICT DO NOTHING
+    """, (
+        now, song_id,
+        psycopg2.extras.Json({"view_count": 0}),
+        psycopg2.extras.Json({"source": "scrapecreators", "result": "no_match"}),
     ))
 
 
@@ -279,54 +403,83 @@ def run():
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         songs = load_songs(cur, MAX_SONGS)
 
-    log.info(f"ScrapeCreators collector: processing {len(songs)} songs")
+    log.info(f"ScrapeCreators collector: {len(songs)} songs to process "
+             f"(~{len(songs) * 2} credits)")
 
-    hits = misses = errors = 0
+    tt_hits = tt_misses = yt_hits = yt_misses = errors = 0
 
     for song in songs:
         song_id = str(song["song_id"])
         title   = song["title"]
         artist  = song["artist"]
-        log.info(f"  Searching: '{title}' — {artist}")
+        log.info(f"  '{title}' — {artist}")
 
+        # ── TikTok lookup ──────────────────────────────────────────────────
         try:
-            sounds = search_sounds(title, artist)
+            sounds   = search_tiktok_sounds(title, artist)
+            tt_match = find_best_sound(title, artist, sounds)
         except RuntimeError as e:
-            if str(e) in ("out_of_credits", "invalid_api_key"):
-                log.error("Fatal API error — stopping run early")
-                break
-            sounds = []
-            errors += 1
+            log.error(f"Fatal: {e} — stopping run")
+            break
+        except Exception as e:
+            log.warning(f"    TikTok error: {e}")
+            sounds   = []
+            tt_match = None
+            errors  += 1
 
-        best = find_best_sound(title, artist, sounds) if sounds else None
+        # ── YouTube lookup ─────────────────────────────────────────────────
+        time.sleep(0.2)
+        try:
+            yt_match = search_youtube_video(title, artist)
+        except RuntimeError as e:
+            log.error(f"Fatal: {e} — stopping run")
+            break
+        except Exception as e:
+            log.warning(f"    YouTube error: {e}")
+            yt_match = None
+            errors  += 1
 
+        # ── Write both signals ─────────────────────────────────────────────
         try:
             with conn.cursor() as cur:
-                if best:
-                    write_signal(cur, song_id, best, now)
+                if tt_match:
+                    write_tiktok_signal(cur, song_id, tt_match, now)
                     log.info(
-                        f"    ✓ {best['user_count']:>10,} TikTok videos | "
-                        f"'{best['title']}' by '{best['author']}'"
+                        f"    TT ✓ {tt_match['user_count']:>10,} videos | "
+                        f"'{tt_match['title']}' by '{tt_match['author']}'"
                     )
-                    hits += 1
+                    tt_hits += 1
                 else:
-                    write_no_match(cur, song_id, now)
-                    reason = f"among {len(sounds)} sounds" if sounds else "no sounds returned"
-                    log.info(f"    — no match {reason}")
-                    misses += 1
+                    write_tiktok_no_match(cur, song_id, now)
+                    log.info(f"    TT — no match ({len(sounds)} sounds checked)")
+                    tt_misses += 1
+
+                if yt_match:
+                    write_youtube_signal(cur, song_id, yt_match, now)
+                    log.info(
+                        f"    YT ✓ {yt_match['view_count']:>12,} views | "
+                        f"'{yt_match['title']}'"
+                    )
+                    yt_hits += 1
+                else:
+                    write_youtube_no_match(cur, song_id, now)
+                    log.info(f"    YT — no match")
+                    yt_misses += 1
+
             conn.commit()
         except Exception as e:
             conn.rollback()
             log.warning(f"    DB error for '{title}': {e}")
             errors += 1
 
-        time.sleep(0.3)   # ~3 req/sec
+        time.sleep(0.3)
 
     conn.close()
     log.info(
-        f"ScrapeCreators collector complete — "
-        f"{hits} hits, {misses} misses, {errors} errors "
-        f"out of {hits + misses + errors} songs processed"
+        f"ScrapeCreators collector done — "
+        f"TikTok: {tt_hits} hits / {tt_misses} misses | "
+        f"YouTube: {yt_hits} hits / {yt_misses} misses | "
+        f"{errors} errors"
     )
 
 

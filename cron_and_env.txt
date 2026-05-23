@@ -17,8 +17,8 @@
 # Spotify Playlist Seeder — daily at 07:00 UTC (before Spotify chart collector)
 0 7 * * * cd /app && python -m collectors.spotify_playlist_seeder >> /var/log/everywhere-chart/spotify_seeder.log 2>&1
 
-# ScrapeCreators TikTok Usage — daily at 10:00 UTC (after Spotify seeder + chart)
-# Processes up to 1000 songs/day (1 credit each)
+# ScrapeCreators TikTok + YouTube catalog enrichment — daily at 10:00 UTC
+# Processes up to 500 songs/day (2 credits each = 1000 credits/day)
 0 10 * * * cd /app && python -m collectors.scrapecreators_collector >> /var/log/everywhere-chart/scrapecreators.log 2>&1
 
 # Spotify Enricher — daily at 11:00 UTC (upgrades placeholder IDs to real Spotify IDs)
