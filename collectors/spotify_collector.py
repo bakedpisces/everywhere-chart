@@ -16,6 +16,7 @@ and adds them to the communities table.
 Schedule: daily at 08:00 UTC
 """
 
+import math
 import os
 import re
 import time
@@ -73,12 +74,21 @@ def _parse_entries(entries: list, chart: dict) -> list[dict]:
         if not title or not artist:
             continue
 
+        # Stream count is in rankingMetric (auth/v0 only; None on public/v0)
+        ranking_metric = entry_data.get("rankingMetric", {})
+        streams = (
+            int(ranking_metric.get("value", 0))
+            if ranking_metric.get("type") == "STREAMS"
+            else None
+        )
+
         rows.append({
             "rank":           entry_data.get("currentRank", 0),
             "prev_rank":      entry_data.get("previousRank"),
             "peak_rank":      entry_data.get("peakRank"),
             "weeks_on_chart": entry_data.get("appearancesOnChart", 0),
             "entry_status":   entry_data.get("entryStatus", ""),
+            "streams":        streams,
             "title":          title,
             "artist":         artist,
             "all_artists":    [a.get("name") for a in artists],
@@ -385,9 +395,20 @@ def insert_chart_signal_event(cur, song_id: str, row: dict,
     """
     Write a signal_event for a chart appearance.
     Intentionality is low (0.15) — chart position is a passive signal.
-    Rank score gives a small bonus to higher-ranked songs.
+
+    Engagement multiplier blends rank score with stream count (when available):
+      - Rank score: 1.0 at #1, 0.0 at #201 (linear)
+      - Stream bonus: log10(streams)/9 capped at 1.0 (matches YouTube formula)
+    If streams unavailable, falls back to rank-only multiplier.
     """
-    rank_score = max(0, (51 - row["rank"]) / 50)  # 1.0 at #1, ~0 at #50
+    rank_score = max(0.0, (201 - row["rank"]) / 200)   # 1.0 at #1, 0.0 at #201
+
+    streams = row.get("streams")
+    if streams and streams > 0:
+        stream_score = min(1.0, math.log10(streams) / 9)  # 1M→0.67, 10M→0.78, 100M→0.89
+        mult = round(1 + (rank_score * 0.5 + stream_score * 0.5), 3)
+    else:
+        mult = round(1 + rank_score, 3)
 
     cur.execute("""
         INSERT INTO signal_events (
@@ -406,14 +427,16 @@ def insert_chart_signal_event(cur, song_id: str, row: dict,
             "prev_rank":      row["prev_rank"],
             "weeks_on_chart": row["weeks_on_chart"],
             "entry_status":   row["entry_status"],
+            "streams":        streams,
         }),
-        round(1 + rank_score, 3),
-        round(INTENTIONALITY_CHART_POSITION * (1 + rank_score), 4),
+        mult,
+        round(INTENTIONALITY_CHART_POSITION * mult, 4),
         psycopg2.extras.Json({
             "source":     "spotify_charts",
             "chart_name": row["chart_name"],
             "region":     row["region"],
             "rank":       row["rank"],
+            "streams":    streams,
         }),
     ))
 
