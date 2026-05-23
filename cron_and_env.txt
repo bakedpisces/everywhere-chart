@@ -1,0 +1,48 @@
+# ============================================================
+# THE EVERYWHERE CHART — CRON SCHEDULE
+# ============================================================
+# Add to crontab with: crontab -e
+# Assumes collectors live at /app/collectors/
+# Logs go to /var/log/everywhere-chart/
+
+# Spotify Charts — daily at 08:00 UTC (charts update overnight)
+0 8 * * * cd /app && python -m collectors.spotify_collector >> /var/log/everywhere-chart/spotify.log 2>&1
+
+# Shazam — every 6 hours
+0 */6 * * * cd /app && python -m collectors.shazam_collector >> /var/log/everywhere-chart/shazam.log 2>&1
+
+# Reddit — every 6 hours, offset by 1h from Shazam to spread load
+0 1,7,13,19 * * * cd /app && python -m collectors.reddit_collector >> /var/log/everywhere-chart/reddit.log 2>&1
+
+# Spotify Playlist Seeder — daily at 07:00 UTC (before Spotify chart collector)
+0 7 * * * cd /app && python -m collectors.spotify_playlist_seeder >> /var/log/everywhere-chart/spotify_seeder.log 2>&1
+
+# ScrapeCreators TikTok Usage — daily at 10:00 UTC (after Spotify seeder + chart)
+# Processes up to 1000 songs/day (1 credit each)
+0 10 * * * cd /app && python -m collectors.scrapecreators_collector >> /var/log/everywhere-chart/scrapecreators.log 2>&1
+
+# Spotify Enricher — daily at 11:00 UTC (upgrades placeholder IDs to real Spotify IDs)
+0 11 * * * cd /app && python -m collectors.spotify_enricher >> /var/log/everywhere-chart/spotify_enricher.log 2>&1
+
+
+# ============================================================
+# .env.template — copy to .env and fill in values
+# ============================================================
+
+# Database
+DATABASE_URL=postgresql://user:password@localhost:5432/everywhere_chart
+
+# Spotify (register app at developer.spotify.com)
+SPOTIFY_CLIENT_ID=
+SPOTIFY_CLIENT_SECRET=
+
+# Reddit (register app at reddit.com/prefs/apps — choose "script")
+REDDIT_CLIENT_ID=
+REDDIT_CLIENT_SECRET=
+REDDIT_USER_AGENT=everywhere-chart/0.1 (contact: your@email.com)
+
+# Shazam via RapidAPI (rapidapi.com/apidojo/api/shazam)
+RAPIDAPI_KEY=
+
+# ScrapeCreators (app.scrapecreators.com — TikTok sound usage lookups)
+SCRAPECREATORS_API_KEY=

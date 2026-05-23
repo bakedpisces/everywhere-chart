@@ -181,10 +181,35 @@ def fetch_all_charts() -> dict[str, list[dict]]:
             results[chart["name"]] = rows
             page.close()
 
+        # ── Extract user access token before closing ──────────────────────
+        # Navigate to the web-player token endpoint while the sp_dc cookie
+        # is still active in this context. This gives us a user-level token
+        # that the playlist seeder can use to read playlist tracks.
+        user_token: Optional[str] = None
+        if SPOTIFY_SP_DC:
+            try:
+                token_page = context.new_page()
+                token_page.goto(
+                    "https://open.spotify.com/get_access_token"
+                    "?reason=transport&productType=web_player",
+                    wait_until="networkidle",
+                    timeout=15_000,
+                )
+                token_data = token_page.evaluate(
+                    "() => { try { return JSON.parse(document.body.innerText); } "
+                    "catch(e) { return null; } }"
+                )
+                if token_data and token_data.get("accessToken"):
+                    user_token = token_data["accessToken"]
+                    log.info("User access token extracted for playlist seeder")
+                token_page.close()
+            except Exception as e:
+                log.warning(f"Could not extract user token: {e}")
+
         context.close()
         browser.close()
 
-    return results
+    return results, user_token
 
 # ── Spotify Web API — metadata enrichment only ────────────────────────────────
 
@@ -466,7 +491,18 @@ def run(snapshot_date: date = None):
     total_dropped = 0
 
     try:
-        all_chart_rows = fetch_all_charts()
+        all_chart_rows, user_token = fetch_all_charts()
+
+        # Run playlist seeder while we have a valid user token
+        if user_token:
+            try:
+                from collectors.spotify_playlist_seeder import run as seed_playlists
+                log.info("Starting playlist seeder with user token from browser session")
+                seed_playlists(user_token=user_token, conn=conn)
+            except Exception as e:
+                log.warning(f"Playlist seeder failed (non-fatal): {e}")
+        else:
+            log.warning("No user token available — skipping playlist seeder")
 
         seen_spotify_ids: set[str] = set()  # dedupe songs appearing in multiple charts
 
