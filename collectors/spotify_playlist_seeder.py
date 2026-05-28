@@ -44,11 +44,20 @@ SPOTIFY_CLIENT = os.environ.get("SPOTIFY_CLIENT_ID")
 SPOTIFY_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET")
 SPOTIFY_SP_DC  = os.environ.get("SPOTIFY_SP_DC")
 
-SEARCH_KEYWORDS       = ["new", "hot", "hottest", "trending"]
+SEARCH_KEYWORDS       = [
+    "new music 2025",
+    "new music 2026",
+    "trending now",
+    "hot right now",
+    "viral hits",
+    "this week",
+    "new releases",
+    "fresh finds",
+]
 MIN_FOLLOWERS         = 50_000
 TRACKS_PER_PLAYLIST   = 100
 SEARCH_LIMIT          = 10    # Spotify playlist search max per page
-SEARCH_PAGES          = 20    # pages per keyword → up to 200 candidates
+SEARCH_PAGES          = 10    # pages per keyword (fewer pages, better keywords)
 FOLLOWER_FETCH_LIMIT  = 100   # cap full-playlist fetches per keyword to limit API calls
 MAX_PLAYLISTS_PER_RUN = 50    # cap total playlists seeded per run
 
@@ -57,6 +66,16 @@ EDITORIAL_OWNERS = {"spotify", "spotifycharts"}
 
 # Songs released within this window are considered "new"
 UNDER_RADAR_RELEASE_DAYS = 60
+
+# Playlist name patterns that indicate static/retrospective collections — skip these
+import re as _re
+_STATIC_PLAYLIST = _re.compile(
+    r"\b(greatest hits|best of|discography|anthology|classics|"
+    r"collection|all time|timeless|throwback|retro|"
+    r"90s|90\'s|80s|80\'s|70s|70\'s|00s|00\'s|"
+    r"decades|era|back in|back to the)\b",
+    _re.IGNORECASE,
+)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -261,14 +280,20 @@ def search_playlists(keyword: str) -> list[dict]:
             time.sleep(0.1)
             continue
 
+        pl_name = full.get("name", "")
+        if _STATIC_PLAYLIST.search(pl_name):
+            log.info(f"  [{keyword}] Skipping '{pl_name}' — static/retrospective playlist")
+            time.sleep(0.1)
+            continue
+
         found[pl_id] = {
             "id":        pl_id,
-            "name":      full.get("name", ""),
+            "name":      pl_name,
             "followers": followers,
             "owner":     (full.get("owner") or {}).get("id", ""),
         }
         log.info(
-            f"  [{keyword}] '{full.get('name', '')}' "
+            f"  [{keyword}] '{pl_name}' "
             f"({followers:,} followers) ✓"
         )
         time.sleep(0.1)
