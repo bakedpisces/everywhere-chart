@@ -343,6 +343,154 @@ def upgrade_song(conn, row: dict, spotify_item: dict, confidence: float):
     conn.commit()
 
 
+# ── Label backfill ────────────────────────────────────────────────────────────
+
+def load_label_missing(conn, batch_size: int) -> list[dict]:
+    """Songs with a real Spotify ID but no label data yet."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        placeholders = " AND ".join(
+            f"s.spotify_track_id NOT LIKE '{p}%%'" for p in PLACEHOLDER_PREFIXES
+        )
+        cur.execute(f"""
+            SELECT s.id::text AS song_id, s.spotify_track_id, s.title,
+                   a.name AS artist_name
+            FROM songs s
+            JOIN artists a ON a.id = s.artist_id
+            WHERE s.label IS NULL
+              AND s.spotify_track_id IS NOT NULL
+              AND {placeholders}
+            ORDER BY s.created_at DESC
+            LIMIT %s
+        """, (batch_size,))
+        return [dict(r) for r in cur.fetchall()]
+
+
+def backfill_labels(batch_size: int = BATCH_SIZE):
+    """
+    Fetch label + label_tier for songs that have a real Spotify track ID but
+    no label data. Uses batched API calls:
+      - /v1/tracks?ids=...  (50 per call) → extract album IDs
+      - /v1/albums?ids=...  (20 per call) → extract label strings
+    Then classifies and writes label + label_tier to songs table.
+    """
+    from collectors.label_utils import classify_label_tier
+
+    conn = psycopg2.connect(DB_URL)
+    conn.autocommit = False
+    psycopg2.extras.register_uuid()
+
+    songs = load_label_missing(conn, batch_size)
+    log.info(f"Label backfill: {len(songs)} songs missing label data")
+
+    if not songs:
+        log.info("Nothing to backfill.")
+        conn.close()
+        return
+
+    token = get_token()
+    if not token:
+        log.error("No Spotify token — cannot backfill labels")
+        conn.close()
+        return
+
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Index by spotify_track_id for easy lookup
+    by_track_id = {s["spotify_track_id"]: s for s in songs}
+    track_ids   = list(by_track_id.keys())
+
+    # ── Step 1: batch-fetch tracks to get album IDs (50 per call) ─────────
+    album_id_for_song: dict[str, str] = {}   # song_id → album_id
+
+    for i in range(0, len(track_ids), 50):
+        batch = track_ids[i:i+50]
+        try:
+            resp = requests.get(
+                "https://api.spotify.com/v1/tracks",
+                headers=headers,
+                params={"ids": ",".join(batch)},
+                timeout=15,
+            )
+            if resp.status_code == 429:
+                wait = int(resp.headers.get("Retry-After", 10))
+                log.warning(f"Rate limited — waiting {wait}s")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            for track in resp.json().get("tracks") or []:
+                if not track:
+                    continue
+                tid    = track.get("id")
+                row    = by_track_id.get(tid)
+                alb_id = (track.get("album") or {}).get("id")
+                if row and alb_id:
+                    album_id_for_song[row["song_id"]] = alb_id
+        except Exception as e:
+            log.warning(f"Track batch fetch failed: {e}")
+        time.sleep(0.2)
+
+    log.info(f"  Got album IDs for {len(album_id_for_song)}/{len(songs)} songs")
+
+    # ── Step 2: batch-fetch albums for label strings (20 per call) ────────
+    label_for_album: dict[str, str] = {}   # album_id → label string
+
+    unique_album_ids = list(set(album_id_for_song.values()))
+    for i in range(0, len(unique_album_ids), 20):
+        batch = unique_album_ids[i:i+20]
+        try:
+            resp = requests.get(
+                "https://api.spotify.com/v1/albums",
+                headers=headers,
+                params={"ids": ",".join(batch)},
+                timeout=15,
+            )
+            if resp.status_code == 429:
+                wait = int(resp.headers.get("Retry-After", 10))
+                log.warning(f"Rate limited — waiting {wait}s")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            for album in resp.json().get("albums") or []:
+                if not album:
+                    continue
+                aid   = album.get("id")
+                label = album.get("label") or None
+                if aid:
+                    label_for_album[aid] = label
+        except Exception as e:
+            log.warning(f"Album batch fetch failed: {e}")
+        time.sleep(0.2)
+
+    log.info(f"  Got labels for {len(label_for_album)}/{len(unique_album_ids)} albums")
+
+    # ── Step 3: write label + label_tier to songs table ───────────────────
+    updated = skipped = 0
+    with conn.cursor() as cur:
+        for song in songs:
+            alb_id = album_id_for_song.get(song["song_id"])
+            if not alb_id:
+                skipped += 1
+                continue
+            label      = label_for_album.get(alb_id)
+            label_tier = classify_label_tier(label)
+            try:
+                cur.execute("""
+                    UPDATE songs SET label = %s, label_tier = %s
+                    WHERE id = %s::uuid AND label IS NULL
+                """, (label, label_tier, song["song_id"]))
+                updated += cur.rowcount
+            except Exception as e:
+                log.warning(f"  Write failed for '{song['title']}': {e}")
+                skipped += 1
+
+    conn.commit()
+    conn.close()
+    log.info(
+        f"Label backfill complete — {updated} updated, {skipped} skipped "
+        f"(no album ID or write error)"
+    )
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run(batch_size: int = BATCH_SIZE):
@@ -379,5 +527,11 @@ def run(batch_size: int = BATCH_SIZE):
 
 if __name__ == "__main__":
     import sys
-    size = int(sys.argv[1]) if len(sys.argv) > 1 else BATCH_SIZE
-    run(size)
+    args = sys.argv[1:]
+
+    if args and args[0] == "--labels":
+        size = int(args[1]) if len(args) > 1 else BATCH_SIZE
+        backfill_labels(size)
+    else:
+        size = int(args[0]) if args else BATCH_SIZE
+        run(size)
