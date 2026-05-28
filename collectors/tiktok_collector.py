@@ -137,10 +137,11 @@ def fetch_all_regions() -> dict[str, list[dict]]:
             try:
                 pg.goto(
                     f"{CREATIVE_CENTER_URL}?country_code=US",
-                    wait_until="networkidle",
-                    timeout=60_000,
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
                 )
-                pg.wait_for_timeout(3_000)
+                # Brief pause to let JS execute and set session cookies
+                pg.wait_for_timeout(4_000)
             except Exception as e:
                 log.warning(f"Page load warning (continuing anyway): {e}")
 

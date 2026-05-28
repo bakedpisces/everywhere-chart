@@ -57,6 +57,9 @@ CHARTS_TO_FETCH = [
 # Chart position is a passive signal — low intentionality score
 INTENTIONALITY_CHART_POSITION = 0.15
 
+# Max artist pages to load per run for play-count scraping (each ~5-10s)
+MAX_ARTIST_STREAM_FETCHES = 20
+
 # ── Chart fetching ────────────────────────────────────────────────────────────
 
 def _parse_entries(entries: list, chart: dict) -> list[dict]:
@@ -118,7 +121,7 @@ def _parse_chart_response(data: dict, chart: dict) -> list[dict]:
     return []
 
 
-def fetch_all_charts() -> dict[str, list[dict]]:
+def fetch_all_charts(artist_spotify_ids: list[str] = None) -> tuple:
     """
     Launch one Playwright browser, optionally inject the sp_dc session
     cookie, load each chart page, and intercept the API response.
@@ -126,7 +129,14 @@ def fetch_all_charts() -> dict[str, list[dict]]:
     With sp_dc: captures auth/v0 response (200 songs per chart).
     Without:    captures public/v0 response (50 songs per chart).
 
-    Returns {chart_name: [rows]}.
+    If artist_spotify_ids is provided, also loads each artist's page on
+    open.spotify.com to intercept play counts from the internal GraphQL
+    endpoint — used to get stream data for non-chart (under-radar) songs.
+
+    Returns (chart_results, user_token, artist_stream_data) where:
+      chart_results      = {chart_name: [rows]}
+      user_token         = str | None
+      artist_stream_data = {artist_spotify_id: [{track_id, track_name, playcount}]}
     """
     from playwright.sync_api import sync_playwright
 
@@ -216,10 +226,64 @@ def fetch_all_charts() -> dict[str, list[dict]]:
             except Exception as e:
                 log.warning(f"Could not extract user token: {e}")
 
+        # ── Artist page play counts (under-radar / non-chart songs) ──────────
+        artist_stream_data: dict[str, list[dict]] = {}
+        if SPOTIFY_SP_DC and artist_spotify_ids:
+            to_fetch = artist_spotify_ids[:MAX_ARTIST_STREAM_FETCHES]
+            log.info(f"Fetching play counts for {len(to_fetch)} artists via artist pages")
+            for artist_id in to_fetch:
+                page = context.new_page()
+                try:
+                    with page.expect_response(
+                        lambda r: (
+                            "api-partner.spotify.com/pathfinder" in r.url
+                            and "queryArtistOverview" in r.url
+                        ),
+                        timeout=15_000,
+                    ) as resp_info:
+                        page.goto(
+                            f"https://open.spotify.com/artist/{artist_id}",
+                            wait_until="domcontentloaded",
+                            timeout=30_000,
+                        )
+                    data = resp_info.value.json()
+                    top_tracks = (
+                        data.get("data", {})
+                            .get("artistUnion", {})
+                            .get("discography", {})
+                            .get("topTracks", {})
+                            .get("items", [])
+                    )
+                    tracks = []
+                    for item in top_tracks:
+                        track = item.get("track", {})
+                        uri   = track.get("uri", "")
+                        tid   = uri.replace("spotify:track:", "") if uri else track.get("id", "")
+                        try:
+                            playcount = int(track.get("playcount") or 0)
+                        except (ValueError, TypeError):
+                            playcount = 0
+                        if tid and playcount > 0:
+                            tracks.append({
+                                "track_id":   tid,
+                                "track_name": track.get("name", ""),
+                                "playcount":  playcount,
+                            })
+                    if tracks:
+                        artist_stream_data[artist_id] = tracks
+                        log.info(f"  Artist {artist_id}: {len(tracks)} tracks with play counts")
+                    else:
+                        log.info(f"  Artist {artist_id}: no play count data in response")
+                except Exception as e:
+                    log.warning(f"  Artist {artist_id} page failed: {e}")
+                finally:
+                    page.close()
+                time.sleep(1.0)
+
         context.close()
         browser.close()
 
-    return results, user_token
+    return results, user_token, artist_stream_data
 
 # ── Spotify Web API — metadata enrichment only ────────────────────────────────
 
@@ -440,6 +504,41 @@ def insert_chart_signal_event(cur, song_id: str, row: dict,
         }),
     ))
 
+def insert_stream_count_signal(cur, song_id: str, track_data: dict,
+                               snapshot_date: date):
+    """
+    Write a signal_event for an artist-page play count.
+    Uses the same intentionality as chart_position (passive signal).
+    external_id is date-scoped so we get a daily time series.
+    """
+    playcount    = track_data["playcount"]
+    stream_score = min(1.0, math.log10(max(playcount, 1)) / 9)
+    mult         = round(1 + stream_score, 3)
+    cur.execute("""
+        INSERT INTO signal_events (
+            observed_at, song_id, source_platform, signal_type,
+            intentionality_score, raw_engagement, engagement_multiplier,
+            weighted_score, is_home_community, external_id, context_snapshot
+        )
+        VALUES (%s, %s, 'spotify', 'stream_count', %s, %s, %s, %s, FALSE, %s, %s)
+        ON CONFLICT DO NOTHING
+    """, (
+        datetime.combine(snapshot_date, datetime.min.time()).replace(tzinfo=timezone.utc),
+        song_id,
+        INTENTIONALITY_CHART_POSITION,
+        psycopg2.extras.Json({"playcount": playcount}),
+        mult,
+        round(INTENTIONALITY_CHART_POSITION * mult, 4),
+        f"sp_pc_{track_data['track_id']}_{snapshot_date}",
+        psycopg2.extras.Json({
+            "source":      "spotify_artist_page",
+            "track_id":    track_data["track_id"],
+            "track_name":  track_data["track_name"],
+            "playcount":   playcount,
+        }),
+    ))
+
+
 # ── Artist subreddit discovery ────────────────────────────────────────────────
 
 REDDIT_HEADERS = {"User-Agent": "everywhere-chart/0.1"}
@@ -514,7 +613,25 @@ def run(snapshot_date: date = None):
     total_dropped = 0
 
     try:
-        all_chart_rows, user_token = fetch_all_charts()
+        # Query under-radar artist IDs before launching Playwright so we can
+        # fetch their play counts in the same browser session.
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT DISTINCT a.spotify_artist_id
+                FROM songs s
+                JOIN artists a ON a.id = s.artist_id
+                WHERE s.under_radar = TRUE
+                  AND a.spotify_artist_id IS NOT NULL
+                  AND a.spotify_artist_id NOT LIKE 'unknown_%%'
+                ORDER BY a.spotify_artist_id
+                LIMIT %s
+            """, (MAX_ARTIST_STREAM_FETCHES,))
+            under_radar_artist_ids = [r["spotify_artist_id"] for r in cur.fetchall()]
+        log.info(f"Under-radar artists to stream-count: {len(under_radar_artist_ids)}")
+
+        all_chart_rows, user_token, artist_stream_data = fetch_all_charts(
+            artist_spotify_ids=under_radar_artist_ids,
+        )
 
         seen_spotify_ids: set[str] = set()  # dedupe songs appearing in multiple charts
 
@@ -611,6 +728,38 @@ def run(snapshot_date: date = None):
             f"Spotify collector complete — "
             f"{total_events} events written, {total_dropped} dropped"
         )
+
+        # ── Artist play counts for under-radar / non-chart songs ──────────
+        # artist_stream_data: {artist_spotify_id: [{track_id, track_name, playcount}]}
+        if artist_stream_data:
+            stream_hits = stream_skipped = 0
+            for artist_spotify_id, tracks in artist_stream_data.items():
+                for track_data in tracks:
+                    try:
+                        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                            cur.execute(
+                                "SELECT id FROM songs WHERE spotify_track_id = %s",
+                                (track_data["track_id"],)
+                            )
+                            row = cur.fetchone()
+                            if row:
+                                insert_stream_count_signal(
+                                    cur, str(row["id"]), track_data, snapshot_date
+                                )
+                                stream_hits += 1
+                            else:
+                                stream_skipped += 1
+                        conn.commit()
+                    except Exception as e:
+                        conn.rollback()
+                        log.warning(
+                            f"Stream count write failed for "
+                            f"'{track_data['track_name']}': {e}"
+                        )
+            log.info(
+                f"Artist play counts — {stream_hits} signals written, "
+                f"{stream_skipped} tracks not in catalog"
+            )
 
         # ── Playlist seeder — runs after chart data is safely committed ───
         # Needs the user-level token extracted from the Playwright session.

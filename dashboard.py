@@ -19,7 +19,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 DB_URL = os.environ["DATABASE_URL"]
 
 # ── Page config ───────────────────────────────────────────────────────────────
