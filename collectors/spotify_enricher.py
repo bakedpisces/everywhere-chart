@@ -491,6 +491,99 @@ def backfill_labels(batch_size: int = BATCH_SIZE):
     )
 
 
+# ── Genre backfill ────────────────────────────────────────────────────────────
+
+def backfill_genres(batch_size: int = BATCH_SIZE):
+    """
+    Fetch genre_tags for artists that have an empty or null genre list.
+    Uses the /v1/artists?ids=... batch endpoint (50 per call).
+    Updates both the artists table and the songs table (genre_tags is
+    denormalised onto songs for query convenience).
+    """
+    conn = psycopg2.connect(DB_URL)
+    conn.autocommit = False
+    psycopg2.extras.register_uuid()
+
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT id::text AS artist_id, name, spotify_artist_id
+            FROM artists
+            WHERE (genre_tags IS NULL OR genre_tags = '{}')
+              AND spotify_artist_id IS NOT NULL
+              AND spotify_artist_id NOT LIKE 'unknown_%%'
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, (batch_size,))
+        artists = [dict(r) for r in cur.fetchall()]
+
+    log.info(f"Genre backfill: {len(artists)} artists missing genre data")
+    if not artists:
+        log.info("Nothing to backfill.")
+        conn.close()
+        return
+
+    token = get_token()
+    if not token:
+        log.error("No Spotify token — cannot backfill genres")
+        conn.close()
+        return
+
+    headers = {"Authorization": f"Bearer {token}"}
+    by_spotify_id = {a["spotify_artist_id"]: a for a in artists}
+
+    updated = skipped = 0
+
+    for i in range(0, len(artists), 50):
+        batch_ids = [a["spotify_artist_id"] for a in artists[i:i+50]]
+        try:
+            resp = requests.get(
+                "https://api.spotify.com/v1/artists",
+                headers=headers,
+                params={"ids": ",".join(batch_ids)},
+                timeout=15,
+            )
+            if resp.status_code == 429:
+                wait = int(resp.headers.get("Retry-After", 10))
+                log.warning(f"Rate limited — waiting {wait}s")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+
+            for artist_obj in resp.json().get("artists") or []:
+                if not artist_obj:
+                    skipped += 1
+                    continue
+                sid    = artist_obj["id"]
+                genres = artist_obj.get("genres") or []
+                row    = by_spotify_id.get(sid)
+                if not row or not genres:
+                    skipped += 1
+                    continue
+
+                with conn.cursor() as cur:
+                    # Update artist
+                    cur.execute("""
+                        UPDATE artists SET genre_tags = %s, updated_at = NOW()
+                        WHERE id = %s::uuid
+                    """, (genres, row["artist_id"]))
+                    # Propagate to songs (denormalised copy)
+                    cur.execute("""
+                        UPDATE songs SET genre_tags = %s
+                        WHERE artist_id = %s::uuid
+                          AND (genre_tags IS NULL OR genre_tags = '{}')
+                    """, (genres, row["artist_id"]))
+                    updated += 1
+
+        except Exception as e:
+            log.warning(f"Artist batch fetch failed: {e}")
+
+        conn.commit()
+        time.sleep(0.2)
+
+    conn.close()
+    log.info(f"Genre backfill complete — {updated} artists updated, {skipped} skipped")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run(batch_size: int = BATCH_SIZE):
@@ -532,6 +625,14 @@ if __name__ == "__main__":
     if args and args[0] == "--labels":
         size = int(args[1]) if len(args) > 1 else BATCH_SIZE
         backfill_labels(size)
+    elif args and args[0] == "--genres":
+        size = int(args[1]) if len(args) > 1 else BATCH_SIZE
+        backfill_genres(size)
+    elif args and args[0] == "--all":
+        size = int(args[1]) if len(args) > 1 else BATCH_SIZE
+        run(size)
+        backfill_labels(size)
+        backfill_genres(size)
     else:
         size = int(args[0]) if args else BATCH_SIZE
         run(size)
