@@ -33,7 +33,7 @@ import logging
 import requests
 import psycopg2
 import psycopg2.extras
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -539,12 +539,22 @@ def refresh_under_radar(conn):
 
 
 def already_seeded_today(cur, playlist_id: str) -> bool:
+    """
+    Skip playlists seeded in the last 23h — UNLESS they returned 0 tracks
+    (likely a 403), in which case retry after 1 hour.
+    """
     cur.execute("""
-        SELECT 1 FROM seeded_playlists
+        SELECT tracks_added, last_seeded FROM seeded_playlists
         WHERE playlist_id = %s
-          AND last_seeded >= NOW() - INTERVAL '23 hours'
     """, (playlist_id,))
-    return cur.fetchone() is not None
+    row = cur.fetchone()
+    if not row:
+        return False
+    if row["tracks_added"] == 0:
+        # Previous run got no tracks (probably 403) — retry after 1 hour
+        return row["last_seeded"] >= datetime.now(timezone.utc) - timedelta(hours=1)
+    # Successful seed — standard 23h dedup
+    return row["last_seeded"] >= datetime.now(timezone.utc) - timedelta(hours=23)
 
 
 def mark_seeded(cur, playlist: dict, tracks_added: int):
