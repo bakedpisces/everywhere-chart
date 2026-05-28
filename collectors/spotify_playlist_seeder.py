@@ -332,6 +332,7 @@ def fetch_playlist_tracks(playlist_id: str) -> list[dict]:
                 "artist":       artists[0].get("name", "").strip(),
                 "artist_id":    artists[0].get("id", ""),
                 "isrc":         track.get("external_ids", {}).get("isrc"),
+                "album_id":     track.get("album", {}).get("id", ""),
                 "release_date": _normalize_release_date(
                     track.get("album", {}).get("release_date")
                 ),
@@ -394,17 +395,27 @@ def upsert_track(cur, track: dict) -> Optional[str]:
             )
             artist_id = str(cur.fetchone()["id"])
 
+    # Fetch label for new songs (one extra API call per genuinely new track)
+    from collectors.label_utils import fetch_album_label, classify_label_tier
+    token      = get_token()
+    label      = fetch_album_label(track.get("album_id", ""), token) if token else None
+    label_tier = classify_label_tier(label)
+    time.sleep(0.1)
+
     cur.execute("""
         INSERT INTO songs (
             title, title_normalized, artist_id,
-            spotify_track_id, isrc, genre_tags, release_date
+            spotify_track_id, isrc, genre_tags, release_date, label, label_tier
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (spotify_track_id) DO NOTHING
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (spotify_track_id) DO UPDATE SET
+            label      = COALESCE(EXCLUDED.label, songs.label),
+            label_tier = COALESCE(EXCLUDED.label_tier, songs.label_tier)
         RETURNING id
     """, (
         track["title"], title_norm, artist_id,
         track["spotify_id"], track["isrc"], genres, track["release_date"],
+        label, label_tier,
     ))
     row = cur.fetchone()
     if row:

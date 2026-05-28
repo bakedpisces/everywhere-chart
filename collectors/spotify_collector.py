@@ -365,11 +365,19 @@ def fetch_track_metadata(spotify_id: str) -> Optional[dict]:
                     except Exception:
                         pass
 
+        # fetch album label (requires full album object, not simplified)
+        album_id = track.get("album", {}).get("id")
+        from collectors.label_utils import fetch_album_label, classify_label_tier
+        label     = fetch_album_label(album_id, token) if album_id else None
+        label_tier = classify_label_tier(label)
+
         time.sleep(0.1)  # gentle rate limiting
         return {
             "isrc":         track.get("external_ids", {}).get("isrc"),
             "release_date": track.get("album", {}).get("release_date"),
             "genre_tags":   list(set(genres)),
+            "label":        label,
+            "label_tier":   label_tier,
             "artists": [
                 {"id": a["id"], "name": a["name"]}
                 for a in track.get("artists", [])
@@ -426,17 +434,19 @@ def _normalize_release_date(raw: Optional[str]) -> Optional[str]:
 def upsert_song(cur, title: str, artist_id: str, spotify_id: str,
                 meta: Optional[dict]) -> str:
     """Insert or update song record. Returns internal UUID."""
-    isrc      = meta.get("isrc") if meta else None
-    genres    = meta.get("genre_tags", []) if meta else []
-    rel_date  = _normalize_release_date(meta.get("release_date") if meta else None)
-    track_key = spotify_id or f"unknown_{normalize(title)}"
+    isrc       = meta.get("isrc") if meta else None
+    genres     = meta.get("genre_tags", []) if meta else []
+    rel_date   = _normalize_release_date(meta.get("release_date") if meta else None)
+    label      = meta.get("label") if meta else None
+    label_tier = meta.get("label_tier") if meta else None
+    track_key  = spotify_id or f"unknown_{normalize(title)}"
 
     cur.execute("""
         INSERT INTO songs (
             title, title_normalized, artist_id,
-            spotify_track_id, isrc, genre_tags, release_date
+            spotify_track_id, isrc, genre_tags, release_date, label, label_tier
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (spotify_track_id) DO UPDATE SET
             title      = EXCLUDED.title,
             genre_tags = CASE
@@ -444,9 +454,12 @@ def upsert_song(cur, title: str, artist_id: str, spotify_id: str,
                 THEN EXCLUDED.genre_tags
                 ELSE songs.genre_tags
             END,
+            label      = COALESCE(EXCLUDED.label, songs.label),
+            label_tier = COALESCE(EXCLUDED.label_tier, songs.label_tier),
             updated_at = NOW()
         RETURNING id
-    """, (title, normalize(title), artist_id, track_key, isrc, genres, rel_date))
+    """, (title, normalize(title), artist_id, track_key, isrc, genres, rel_date,
+          label, label_tier))
     song_id = str(cur.fetchone()["id"])
 
     cur.execute("""
