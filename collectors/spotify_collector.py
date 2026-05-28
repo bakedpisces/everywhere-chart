@@ -164,9 +164,23 @@ def fetch_all_charts(artist_spotify_ids: list[str] = None) -> tuple:
 
         context = browser.new_context(**ctx_kwargs)
 
+        # Shared across chart pages — grab the Bearer token from the first
+        # authenticated chart API request (guaranteed user-level when sp_dc active).
+        intercepted_token: dict = {}
+
         for chart in CHARTS_TO_FETCH:
             page     = context.new_page()
             captured = {}
+
+            def on_request(request, intercepted_token=intercepted_token):
+                if CHARTS_API_HOST not in request.url:
+                    return
+                if intercepted_token.get("token"):
+                    return  # already captured
+                auth = request.headers.get("authorization", "")
+                if auth.startswith("Bearer "):
+                    intercepted_token["token"] = auth[len("Bearer "):]
+                    log.info("Bearer token captured from chart API request")
 
             def on_response(response, captured=captured):
                 if CHARTS_API_HOST not in response.url or response.status != 200:
@@ -179,6 +193,7 @@ def fetch_all_charts(artist_spotify_ids: list[str] = None) -> tuple:
                         except Exception:
                             pass
 
+            page.on("request", on_request)
             page.on("response", on_response)
 
             try:
@@ -201,35 +216,17 @@ def fetch_all_charts(artist_spotify_ids: list[str] = None) -> tuple:
             results[chart["name"]] = rows
             page.close()
 
-        # ── Extract user access token before closing ──────────────────────
-        # Navigate to the web-player token endpoint while the sp_dc cookie
-        # is still active in this context. This gives us a user-level token
-        # that the playlist seeder can use to read playlist tracks.
-        user_token: Optional[str] = None
-        if SPOTIFY_SP_DC:
-            try:
-                token_page = context.new_page()
-                token_page.goto(
-                    "https://open.spotify.com/get_access_token"
-                    "?reason=transport&productType=web_player",
-                    wait_until="networkidle",
-                    timeout=15_000,
-                )
-                token_data = token_page.evaluate(
-                    "() => { try { return JSON.parse(document.body.innerText); } "
-                    "catch(e) { return null; } }"
-                )
-                log.info(f"Token endpoint response keys: {list(token_data.keys()) if token_data else 'null'}")
-                if token_data and token_data.get("accessToken") and not token_data.get("isAnonymous", True):
-                    user_token = token_data["accessToken"]
-                    log.info("User access token extracted for playlist seeder")
-                elif token_data and token_data.get("isAnonymous"):
-                    log.warning("Token endpoint returned anonymous token — sp_dc not recognised by open.spotify.com")
-                elif not token_data:
-                    log.warning("Token endpoint returned null/non-JSON response")
-                token_page.close()
-            except Exception as e:
-                log.warning(f"Could not extract user token: {e}")
+        # ── Extract user access token ─────────────────────────────────────
+        # Use the Bearer token intercepted from chart API requests — those
+        # are definitely user-level when sp_dc is active, no extra page load needed.
+        user_token: Optional[str] = intercepted_token.get("token")
+        if user_token:
+            log.info("User token ready for playlist seeder (from chart request headers)")
+        elif SPOTIFY_SP_DC:
+            log.warning(
+                "sp_dc was set but no Bearer token intercepted from chart requests — "
+                "playlist seeder will fall back to sp_dc HTTP call"
+            )
 
         # ── Artist page play counts (under-radar / non-chart songs) ──────────
         artist_stream_data: dict[str, list[dict]] = {}
