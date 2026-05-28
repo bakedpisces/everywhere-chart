@@ -219,9 +219,14 @@ def fetch_all_charts(artist_spotify_ids: list[str] = None) -> tuple:
                     "() => { try { return JSON.parse(document.body.innerText); } "
                     "catch(e) { return null; } }"
                 )
-                if token_data and token_data.get("accessToken"):
+                log.info(f"Token endpoint response keys: {list(token_data.keys()) if token_data else 'null'}")
+                if token_data and token_data.get("accessToken") and not token_data.get("isAnonymous", True):
                     user_token = token_data["accessToken"]
                     log.info("User access token extracted for playlist seeder")
+                elif token_data and token_data.get("isAnonymous"):
+                    log.warning("Token endpoint returned anonymous token — sp_dc not recognised by open.spotify.com")
+                elif not token_data:
+                    log.warning("Token endpoint returned null/non-JSON response")
                 token_page.close()
             except Exception as e:
                 log.warning(f"Could not extract user token: {e}")
@@ -762,19 +767,17 @@ def run(snapshot_date: date = None):
             )
 
         # ── Playlist seeder — runs after chart data is safely committed ───
-        # Needs the user-level token extracted from the Playwright session.
-        if user_token:
-            try:
-                from collectors.spotify_playlist_seeder import run as seed_playlists
+        # Pass the Playwright-extracted user token if we got one; otherwise
+        # the seeder falls back to sp_dc directly (also works for track reads).
+        try:
+            from collectors.spotify_playlist_seeder import run as seed_playlists
+            if user_token:
                 log.info("Starting playlist seeder with user token from Playwright session")
-                seed_playlists(user_token=user_token, conn=conn)
-            except Exception as e:
-                log.warning(f"Playlist seeder failed (non-fatal): {e}")
-        else:
-            log.warning(
-                "No user token available — skipping playlist seeder. "
-                "Ensure SPOTIFY_SP_DC is set so the Playwright session can extract a token."
-            )
+            else:
+                log.info("Starting playlist seeder with sp_dc fallback (no Playwright token)")
+            seed_playlists(user_token=user_token, conn=conn)
+        except Exception as e:
+            log.warning(f"Playlist seeder failed (non-fatal): {e}")
 
     except Exception as e:
         with conn.cursor() as cur:
