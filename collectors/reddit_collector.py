@@ -35,9 +35,18 @@ log = logging.getLogger("reddit_collector")
 # ── Config ──────────────────────────────────────────────────────────────────
 
 DB_URL = os.environ["DATABASE_URL"]
+
+# Reddit OAuth app credentials (script-type app from reddit.com/prefs/apps)
+REDDIT_CLIENT_ID     = os.environ.get("REDDIT_CLIENT_ID", "")
+REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "")
+REDDIT_USERNAME      = os.environ.get("REDDIT_USERNAME", "")    # optional, for script apps
+REDDIT_PASSWORD      = os.environ.get("REDDIT_PASSWORD", "")    # optional, for script apps
+
+# Reddit requires a specific UA format: platform:app_id:version (by /u/username)
+_ua_user = f" (by /u/{REDDIT_USERNAME})" if REDDIT_USERNAME else " (contact: chart@example.com)"
 REDDIT_USER_AGENT = os.environ.get(
     "REDDIT_USER_AGENT",
-    "everywhere-chart/0.1 (contact: chart@example.com)"
+    f"linux:everywhere-chart:v1.0{_ua_user}"
 )
 
 # Intentionality scores by signal type
@@ -49,13 +58,61 @@ INTENTIONALITY = {
 POLL_LIMIT = 100
 MIN_RESOLUTION_CONFIDENCE = 0.65
 
-# ── Reddit public JSON API ────────────────────────────────────────────────────
-# No credentials required. Rate limit: ~1 req/sec for unauthenticated access.
+# ── Reddit OAuth ──────────────────────────────────────────────────────────────
+
+_oauth_token_cache: dict = {}
+
+def _get_oauth_token() -> Optional[str]:
+    """
+    Get an application-only OAuth token using client credentials.
+    Works without a user login — just needs REDDIT_CLIENT_ID + SECRET.
+    Token lasts ~1 hour; cached and refreshed automatically.
+    """
+    if not REDDIT_CLIENT_ID or not REDDIT_CLIENT_SECRET:
+        return None
+    now = time.time()
+    if _oauth_token_cache.get("expires_at", 0) > now + 60:
+        return _oauth_token_cache["token"]
+    try:
+        resp = requests.post(
+            "https://www.reddit.com/api/v1/access_token",
+            auth=(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET),
+            data={"grant_type": "client_credentials"},
+            headers={"User-Agent": REDDIT_USER_AGENT},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        token = data.get("access_token")
+        if token:
+            _oauth_token_cache["token"]      = token
+            _oauth_token_cache["expires_at"] = now + data.get("expires_in", 3600)
+            log.info("Reddit OAuth token acquired (application-only)")
+            return token
+    except Exception as e:
+        log.warning(f"Reddit OAuth token request failed: {e}")
+    return None
+
+
+# ── Reddit API (OAuth preferred, public JSON fallback) ────────────────────────
 
 def reddit_get(path: str, params: dict = None) -> dict:
-    """GET from Reddit's public JSON API with retry on rate limit."""
-    url = f"https://www.reddit.com{path}.json"
-    headers = {"User-Agent": REDDIT_USER_AGENT}
+    """
+    GET from Reddit API.
+    Uses OAuth (oauth.reddit.com) when credentials are available —
+    bypasses the IP-level 403 blocks on the public API.
+    Falls back to www.reddit.com public JSON endpoint.
+    """
+    token = _get_oauth_token()
+    if token:
+        url     = f"https://oauth.reddit.com{path}"
+        headers = {
+            "User-Agent":    REDDIT_USER_AGENT,
+            "Authorization": f"bearer {token}",
+        }
+    else:
+        url     = f"https://www.reddit.com{path}.json"
+        headers = {"User-Agent": REDDIT_USER_AGENT}
     for attempt in range(3):
         result: dict = {}
         error: list = []
