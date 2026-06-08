@@ -523,12 +523,35 @@ def insert_stream_count_signal(cur, song_id: str, track_data: dict,
                                snapshot_date: date):
     """
     Write a signal_event for an artist-page play count.
-    Uses the same intentionality as chart_position (passive signal).
-    external_id is date-scoped so we get a daily time series.
+
+    Scores on the DELTA (new plays since last snapshot) rather than the
+    raw cumulative total — this measures velocity, not catalogue size.
+    Falls back to the full playcount on first observation (no baseline yet).
+    Stores both total and delta in context_snapshot for trend analysis.
     """
-    playcount    = track_data["playcount"]
-    stream_score = min(1.0, math.log10(max(playcount, 1)) / 9)
+    playcount = track_data["playcount"]
+
+    # Look up the most recent prior playcount for this track
+    cur.execute("""
+        SELECT (context_snapshot->>'playcount_total')::bigint AS prev_total
+        FROM signal_events
+        WHERE song_id = %s::uuid
+          AND signal_type = 'stream_count'
+          AND source_platform = 'spotify'
+          AND observed_at < %s
+        ORDER BY observed_at DESC
+        LIMIT 1
+    """, (song_id, datetime.combine(snapshot_date, datetime.min.time()).replace(tzinfo=timezone.utc)))
+    row = cur.fetchone()
+
+    prev_total  = row[0] if row and row[0] else None
+    delta       = (playcount - prev_total) if prev_total is not None else playcount
+    delta       = max(delta, 0)   # guard against Spotify corrections / resets
+    score_basis = delta if delta > 0 else playcount  # use total only on first run
+
+    stream_score = min(1.0, math.log10(max(score_basis, 1)) / 9)
     mult         = round(1 + stream_score, 3)
+
     cur.execute("""
         INSERT INTO signal_events (
             observed_at, song_id, source_platform, signal_type,
@@ -541,15 +564,17 @@ def insert_stream_count_signal(cur, song_id: str, track_data: dict,
         datetime.combine(snapshot_date, datetime.min.time()).replace(tzinfo=timezone.utc),
         song_id,
         INTENTIONALITY_CHART_POSITION,
-        psycopg2.extras.Json({"playcount": playcount}),
+        psycopg2.extras.Json({"playcount_delta": delta, "playcount_total": playcount}),
         mult,
         round(INTENTIONALITY_CHART_POSITION * mult, 4),
         f"sp_pc_{track_data['track_id']}_{snapshot_date}",
         psycopg2.extras.Json({
-            "source":      "spotify_artist_page",
-            "track_id":    track_data["track_id"],
-            "track_name":  track_data["track_name"],
-            "playcount":   playcount,
+            "source":          "spotify_artist_page",
+            "track_id":        track_data["track_id"],
+            "track_name":      track_data["track_name"],
+            "playcount_total": playcount,
+            "playcount_delta": delta,
+            "prev_total":      prev_total,
         }),
     ))
 
