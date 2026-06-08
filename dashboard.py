@@ -93,7 +93,7 @@ def load_signals(window_days: int) -> pd.DataFrame:
             se.is_home_community,
             se.resolution_confidence,
             se.observed_at,
-            c.community_type,
+            COALESCE(c.community_type, se.source_platform) AS community_type,
             c.casual_weight        AS community_casual_weight,
             COALESCE(c.external_id, se.source_platform) AS community_name,
             se.community_id::text,
