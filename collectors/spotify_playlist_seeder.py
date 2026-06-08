@@ -26,6 +26,7 @@ Can also run standalone (python -m collectors.spotify_playlist_seeder)
 using the sp_dc cookie or client credentials as fallback.
 """
 
+import math
 import os
 import re
 import time
@@ -488,11 +489,12 @@ def record_membership(cur, song_id: str, playlist: dict, is_editorial: bool):
         ON CONFLICT (song_id, playlist_id) DO NOTHING
     """, (song_id, playlist["id"], is_editorial, playlist["followers"]))
 
-    # Only add to follower count if this was a genuinely new membership row
+    # Only update counts if this was a genuinely new membership row
     if cur.rowcount > 0:
         cur.execute("""
             UPDATE songs
-            SET playlist_follower_count = COALESCE(playlist_follower_count, 0) + %s
+            SET playlist_follower_count = COALESCE(playlist_follower_count, 0) + %s,
+                playlist_count          = COALESCE(playlist_count, 0) + 1
             WHERE id = %s
         """, (playlist["followers"], song_id))
 
@@ -577,6 +579,70 @@ def mark_seeded(cur, playlist: dict, tracks_added: int):
             followers    = EXCLUDED.followers,
             tracks_added = EXCLUDED.tracks_added
     """, (playlist["id"], playlist["name"], playlist["followers"], tracks_added))
+
+
+# ── Playlist reach signal ─────────────────────────────────────────────────────
+
+def write_playlist_reach_signals(conn):
+    """
+    Write one signal_event per song that has playlist memberships.
+    Called at the end of each seeder run so playlist reach shows up in
+    the dashboard score alongside chart, TikTok, and YouTube signals.
+
+    Engagement multiplier is log-scale on total follower count:
+      50k followers  → ~1.23
+      500k followers → ~1.39
+      5M followers   → ~1.56
+    """
+    today = datetime.now(timezone.utc).date()
+
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT s.id::text AS song_id,
+                   s.playlist_count,
+                   s.playlist_follower_count
+            FROM songs s
+            WHERE s.playlist_count > 0
+        """)
+        songs = cur.fetchall()
+
+    written = 0
+    with conn.cursor() as cur:
+        for song in songs:
+            followers = song["playlist_follower_count"] or 0
+            pl_count  = song["playlist_count"] or 0
+            if followers <= 0:
+                continue
+
+            eng_mult = round(min(2.0, 1 + math.log10(max(followers, 1)) / 9), 3)
+            weighted = round(0.10 * eng_mult, 4)   # low intentionality — passive reach
+
+            cur.execute("""
+                INSERT INTO signal_events (
+                    observed_at, song_id, source_platform, signal_type,
+                    intentionality_score, raw_engagement, engagement_multiplier,
+                    weighted_score, resolution_confidence, is_home_community,
+                    external_id, context_snapshot
+                ) VALUES (%s, %s::uuid, 'spotify', 'playlist_reach',
+                          0.10, %s, %s, %s, 1.0, FALSE, %s, %s)
+                ON CONFLICT DO NOTHING
+            """, (
+                datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc),
+                song["song_id"],
+                psycopg2.extras.Json({"playlist_count": pl_count, "total_followers": followers}),
+                eng_mult,
+                weighted,
+                f"sp_playlist_reach_{song['song_id']}_{today}",
+                psycopg2.extras.Json({
+                    "source":            "spotify_playlist_seeder",
+                    "playlist_count":    pl_count,
+                    "total_followers":   followers,
+                }),
+            ))
+            written += cur.rowcount
+
+    conn.commit()
+    log.info(f"Playlist reach signals: {written} written for {len(songs)} playlisted songs")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -694,6 +760,9 @@ def run(user_token: Optional[str] = None, conn=None):
 
     # ── Update under-radar flags ──────────────────────────────────────────────
     refresh_under_radar(conn)
+
+    # ── Write daily playlist reach signals ────────────────────────────────────
+    write_playlist_reach_signals(conn)
 
     if owns_conn:
         conn.close()
