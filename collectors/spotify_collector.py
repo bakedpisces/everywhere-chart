@@ -18,6 +18,7 @@ Schedule: daily at 08:00 UTC
 
 import math
 import os
+import random
 import re
 import time
 import logging
@@ -305,7 +306,7 @@ def fetch_all_charts(artist_spotify_ids: list[str] = None) -> tuple:
                     log.info(f"  Artist {artist_id}: no api-partner response captured")
 
                 page.close()
-                time.sleep(1.0)
+                time.sleep(1.0 + random.uniform(0.5, 2.0))
 
         context.close()
         browser.close()
