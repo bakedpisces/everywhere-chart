@@ -229,28 +229,53 @@ def fetch_all_charts(artist_spotify_ids: list[str] = None) -> tuple:
             )
 
         # ── Artist page play counts (under-radar / non-chart songs) ──────────
+        # Uses a passive response listener + networkidle wait rather than
+        # expect_response(), which times out if the GraphQL call fires late
+        # or uses a slightly different URL pattern.
         artist_stream_data: dict[str, list[dict]] = {}
         if SPOTIFY_SP_DC and artist_spotify_ids:
             to_fetch = artist_spotify_ids[:MAX_ARTIST_STREAM_FETCHES]
             log.info(f"Fetching play counts for {len(to_fetch)} artists via artist pages")
             for artist_id in to_fetch:
                 page = context.new_page()
-                try:
-                    with page.expect_response(
-                        lambda r: (
-                            "api-partner.spotify.com/pathfinder" in r.url
-                            and "queryArtistOverview" in r.url
-                        ),
-                        timeout=15_000,
-                    ) as resp_info:
-                        page.goto(
-                            f"https://open.spotify.com/artist/{artist_id}",
-                            wait_until="domcontentloaded",
-                            timeout=30_000,
+                captured: dict = {}
+
+                def _on_response(response, captured=captured):
+                    if "api-partner.spotify.com/pathfinder" not in response.url:
+                        return
+                    if captured.get("data"):
+                        return  # already got it
+                    try:
+                        body = response.json()
+                        # Accept any pathfinder response that contains artist top tracks
+                        top = (
+                            body.get("data", {})
+                                .get("artistUnion", {})
+                                .get("discography", {})
+                                .get("topTracks", {})
+                                .get("items", [])
                         )
-                    data = resp_info.value.json()
+                        if top:
+                            captured["data"] = body
+                            captured["url"]  = response.url
+                    except Exception:
+                        pass
+
+                page.on("response", _on_response)
+                try:
+                    page.goto(
+                        f"https://open.spotify.com/artist/{artist_id}",
+                        wait_until="domcontentloaded",
+                        timeout=30_000,
+                    )
+                    # Give the page up to 10s to fire the GraphQL call
+                    page.wait_for_timeout(10_000)
+                except Exception as e:
+                    log.warning(f"  Artist {artist_id} page load failed: {e}")
+
+                if captured.get("data"):
                     top_tracks = (
-                        data.get("data", {})
+                        captured["data"].get("data", {})
                             .get("artistUnion", {})
                             .get("discography", {})
                             .get("topTracks", {})
@@ -273,13 +298,13 @@ def fetch_all_charts(artist_spotify_ids: list[str] = None) -> tuple:
                             })
                     if tracks:
                         artist_stream_data[artist_id] = tracks
-                        log.info(f"  Artist {artist_id}: {len(tracks)} tracks with play counts")
+                        log.info(f"  Artist {artist_id}: {len(tracks)} tracks | via {captured.get('url','?')[:60]}")
                     else:
-                        log.info(f"  Artist {artist_id}: no play count data in response")
-                except Exception as e:
-                    log.warning(f"  Artist {artist_id} page failed: {e}")
-                finally:
-                    page.close()
+                        log.info(f"  Artist {artist_id}: response captured but no playcount data")
+                else:
+                    log.info(f"  Artist {artist_id}: no api-partner response captured")
+
+                page.close()
                 time.sleep(1.0)
 
         context.close()
