@@ -58,7 +58,7 @@ CHARTS_TO_FETCH = [
 INTENTIONALITY_CHART_POSITION = 0.15
 
 # Max artist pages to load per run for play-count scraping (each ~5-10s)
-MAX_ARTIST_STREAM_FETCHES = 20
+MAX_ARTIST_STREAM_FETCHES = 100
 
 # ── Chart fetching ────────────────────────────────────────────────────────────
 
