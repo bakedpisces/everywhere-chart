@@ -781,29 +781,14 @@ def run():
         """)
         communities = cur.fetchall()
 
-    log.info(f"Polling {len(communities)} subreddits")
+    if not REDDIT_CLIENT_ID:
+        log.warning(
+            "REDDIT_CLIENT_ID not set — Reddit API requires OAuth credentials. "
+            "Collector will run but all requests will 403 (Railway IPs are blocked "
+            "from the public API). Set REDDIT_CLIENT_ID + REDDIT_CLIENT_SECRET to enable."
+        )
 
-    # ── Connectivity diagnostic — log exactly what Reddit returns on first call
-    try:
-        import urllib.request
-        test = reddit_get("/r/hiphopheads/new", {"limit": 1})
-        if test:
-            log.info(f"[diag] Reddit connectivity OK — got response with keys: {list(test.keys())}")
-        else:
-            # Try a raw request to surface the actual HTTP status
-            import urllib.request as _ur
-            req = _ur.Request(
-                "https://www.reddit.com/r/hiphopheads/new.json?limit=1",
-                headers={"User-Agent": REDDIT_USER_AGENT},
-            )
-            try:
-                with _ur.urlopen(req, timeout=10) as r:
-                    log.warning(f"[diag] reddit_get returned empty but urllib got HTTP {r.status}")
-            except Exception as ue:
-                log.warning(f"[diag] urllib also failed: {ue}")
-    except Exception as e:
-        log.warning(f"[diag] connectivity test failed: {e}")
-    # ── end diagnostic
+    log.info(f"Polling {len(communities)} subreddits")
 
     total_events  = 0
     total_queued  = 0
