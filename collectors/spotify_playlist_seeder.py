@@ -209,9 +209,24 @@ def _has_user_token() -> bool:
     return bool(_token_cache.get("injected_token") or SPOTIFY_SP_DC)
 
 
+def _contains_artist_name(pl_name: str, artist_names: frozenset) -> bool:
+    """
+    Return True if the playlist name contains a known artist name.
+    Uses substring match (case-insensitive) on names >= 5 chars to avoid
+    false positives from very short names (e.g. 'SZA', 'BTS').
+    """
+    if not artist_names:
+        return False
+    pl_lower = pl_name.lower()
+    for name in artist_names:
+        if name in pl_lower:
+            return True
+    return False
+
+
 # ── Playlist discovery ────────────────────────────────────────────────────────
 
-def search_playlists(keyword: str) -> list[dict]:
+def search_playlists(keyword: str, artist_names: frozenset = frozenset()) -> list[dict]:
     """
     Search Spotify for playlists matching keyword.
 
@@ -284,6 +299,11 @@ def search_playlists(keyword: str) -> list[dict]:
         pl_name = full.get("name", "")
         if _STATIC_PLAYLIST.search(pl_name):
             log.info(f"  [{keyword}] Skipping '{pl_name}' — static/retrospective playlist")
+            time.sleep(0.1)
+            continue
+
+        if _contains_artist_name(pl_name, artist_names):
+            log.info(f"  [{keyword}] Skipping '{pl_name}' — contains artist name")
             time.sleep(0.1)
             continue
 
@@ -711,11 +731,21 @@ def run(user_token: Optional[str] = None, conn=None):
             "or the Spotify collector's Playwright session is providing a token."
         )
 
+    # ── Build artist name filter set ─────────────────────────────────────────
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT lower(trim(name))
+            FROM artists
+            WHERE length(trim(name)) >= 5
+        """)
+        artist_names = frozenset(r[0] for r in cur.fetchall())
+    log.info(f"Loaded {len(artist_names)} artist names for playlist filtering")
+
     # ── Discover playlists ────────────────────────────────────────────────────
     all_playlists: dict[str, dict] = {}
     for keyword in SEARCH_KEYWORDS:
         log.info(f"Searching playlists for keyword: '{keyword}'")
-        results = search_playlists(keyword)
+        results = search_playlists(keyword, artist_names)
         for pl in results:
             all_playlists[pl["id"]] = pl
         log.info(f"  '{keyword}': {len(results)} qualifying playlists found")
