@@ -517,31 +517,59 @@ def refresh_under_radar(conn):
                 under_radar       = TRUE,
                 under_radar_since = COALESCE(under_radar_since, NOW())
             WHERE
-                release_date >= NOW() - INTERVAL '{UNDER_RADAR_RELEASE_DAYS} days'
+                -- Must have a known, recent release date (no NULLs)
+                release_date IS NOT NULL
+                AND release_date >= NOW() - INTERVAL '{UNDER_RADAR_RELEASE_DAYS} days'
+                -- Must have a real Spotify track ID (not a placeholder)
+                AND spotify_track_id IS NOT NULL
+                AND spotify_track_id NOT LIKE 'yt_%%'
+                AND spotify_track_id NOT LIKE 'shazam_%%'
+                AND spotify_track_id NOT LIKE 'tiktok_%%'
+                -- Must be on at least one user-generated playlist
                 AND id IN (
                     SELECT DISTINCT song_id
                     FROM song_playlist_memberships
                     WHERE is_editorial = FALSE
                 )
+                -- Must never have appeared on a Spotify chart
                 AND id NOT IN (
                     SELECT DISTINCT song_id
                     FROM signal_events
                     WHERE source_platform = 'spotify'
                       AND signal_type     = 'chart_position'
                 )
+                -- Exclude songs with very high lifetime play counts
+                -- (if we have stream_count data showing >10M plays, not under-radar)
+                AND id NOT IN (
+                    SELECT DISTINCT song_id
+                    FROM signal_events
+                    WHERE signal_type = 'stream_count'
+                      AND (context_snapshot->>'playcount_total')::bigint > 10000000
+                )
         """)
         flagged = cur.rowcount
         log.info(f"Under-radar: {flagged} songs newly/still flagged")
 
-        # Clear flag for songs that have since made a Spotify chart
-        cur.execute("""
+        # Clear flag for songs that no longer qualify
+        cur.execute(f"""
             UPDATE songs SET under_radar = FALSE
             WHERE under_radar = TRUE
-              AND id IN (
-                  SELECT DISTINCT song_id
-                  FROM signal_events
-                  WHERE source_platform = 'spotify'
-                    AND signal_type     = 'chart_position'
+              AND (
+                  -- Made it onto a Spotify chart
+                  id IN (
+                      SELECT DISTINCT song_id FROM signal_events
+                      WHERE source_platform = 'spotify'
+                        AND signal_type     = 'chart_position'
+                  )
+                  -- Release date now too old (or was NULL all along)
+                  OR release_date IS NULL
+                  OR release_date < NOW() - INTERVAL '{UNDER_RADAR_RELEASE_DAYS} days'
+                  -- Play count now exceeds threshold
+                  OR id IN (
+                      SELECT DISTINCT song_id FROM signal_events
+                      WHERE signal_type = 'stream_count'
+                        AND (context_snapshot->>'playcount_total')::bigint > 10000000
+                  )
               )
         """)
         cleared = cur.rowcount
