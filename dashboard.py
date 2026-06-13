@@ -220,6 +220,12 @@ def compute_scores(df: pd.DataFrame, platform_weights: dict,
         axis=1,
     )
 
+    # Drop rows from platforms weighted to zero — they should contribute nothing,
+    # including to community type counts and diversity scoring
+    d = d[d["adj_score"] > 0]
+    if d.empty:
+        return pd.DataFrame()
+
     # Apply casual weight filter
     if min_casual_weight > 0:
         d = d[
