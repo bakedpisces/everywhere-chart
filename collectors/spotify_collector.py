@@ -570,7 +570,7 @@ def insert_stream_count_signal(cur, song_id: str, track_data: dict,
     """, (song_id, datetime.combine(snapshot_date, datetime.min.time()).replace(tzinfo=timezone.utc)))
     row = cur.fetchone()
 
-    prev_total  = row[0] if row and row[0] else None
+    prev_total  = row["prev_total"] if row and row["prev_total"] else None
     delta       = (playcount - prev_total) if prev_total is not None else playcount
     delta       = max(delta, 0)   # guard against Spotify corrections / resets
     score_basis = delta if delta > 0 else playcount  # use total only on first run
