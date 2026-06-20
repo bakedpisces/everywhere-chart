@@ -112,6 +112,44 @@ def load_signals(window_days: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
+def load_stream_velocity(min_delta: int) -> pd.DataFrame:
+    """Pull latest stream_count signals per song and compute % increase."""
+    conn = psycopg2.connect(DB_URL)
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        WITH latest AS (
+            SELECT DISTINCT ON (song_id)
+                song_id,
+                observed_at::date AS obs_date,
+                (context_snapshot->>'playcount_total')::bigint  AS total,
+                (context_snapshot->>'playcount_delta')::bigint  AS delta
+            FROM signal_events
+            WHERE signal_type = 'stream_count'
+              AND context_snapshot->>'playcount_delta' IS NOT NULL
+            ORDER BY song_id, observed_at DESC
+        )
+        SELECT
+            s.title,
+            a.name        AS artist_name,
+            l.obs_date,
+            l.delta,
+            l.total,
+            l.total - l.delta                                       AS prev_total,
+            ROUND(100.0 * l.delta / NULLIF(l.total - l.delta, 0), 2) AS pct_increase
+        FROM latest l
+        JOIN songs s   ON s.id = l.song_id
+        JOIN artists a ON a.id = s.artist_id
+        WHERE l.delta >= %s
+          AND (l.total - l.delta) > 1000
+        ORDER BY pct_increase DESC NULLS LAST
+        LIMIT 50
+    """, (min_delta,))
+    rows = cur.fetchall()
+    conn.close()
+    return pd.DataFrame([dict(r) for r in rows])
+
+
+@st.cache_data(ttl=300)
 def load_prev_scores(window_days: int) -> dict:
     """Load last week's penetration scores for momentum calculation."""
     prev_date = date.today() - timedelta(days=7)
@@ -197,6 +235,16 @@ with st.sidebar:
 
     st.subheader("Chart")
     chart_size = st.slider("Results to show", 10, 50, 25, 5)
+
+    st.subheader("Stream Velocity")
+    st.caption("Tracks ranked by daily stream % increase.")
+    min_stream_delta = st.select_slider(
+        "Min daily streams",
+        options=[100, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000],
+        value=1_000,
+        help="Only include tracks with at least this many streams today.",
+        format_func=lambda v: f"{v:,}",
+    )
 
     if st.button("🔄 Refresh data from DB"):
         st.cache_data.clear()
@@ -386,11 +434,12 @@ def build_songs_data(scored: pd.DataFrame, df_raw: pd.DataFrame,
     return songs
 
 
-def render_chart_html(songs: list, window_days: int) -> str:
+def render_chart_html(songs: list, window_days: int, velocity: list | None = None) -> str:
     end_dt   = date.today()
     start_dt = end_dt - timedelta(days=window_days)
     date_lbl = f"{start_dt.strftime('%b %-d')} – {end_dt.strftime('%-d, %Y')}"
     songs_js = json.dumps(songs, ensure_ascii=False)
+    velocity_js = json.dumps(velocity or [], ensure_ascii=False)
 
     lead = songs[0] if songs else {}
     sec  = songs[1:3]
@@ -614,21 +663,28 @@ button{{cursor:pointer;font-family:inherit}}
 <div class="card" style="border-top:1px solid var(--rule)" id="card-chart">
   <div class="chart-top">
     <div class="chart-tabs">
-      <button class="ctab on">Crossover</button>
+      <button class="ctab on" id="tab-crossover" onclick="switchTab('crossover')">Crossover</button>
+      <button class="ctab" id="tab-velocity" onclick="switchTab('velocity')">Stream Velocity</button>
     </div>
     <div class="chart-meta">
-      <div class="chart-desc">Out-of-home penetration score &middot; {window_days}-day rolling window</div>
+      <div class="chart-desc" id="chart-desc">Out-of-home penetration score &middot; {window_days}-day rolling window</div>
       <button class="how-btn" onclick="toggleMethod()">How this works</button>
     </div>
     <div class="method-box" id="method-box">
-      Songs are ranked by <strong>cultural penetration</strong> — intentional engagement
+      <span id="method-crossover">Songs are ranked by <strong>cultural penetration</strong> — intentional engagement
       across communities far from a song's home fanbase. A mention in a cooking forum
       outweighs thousands of plays in an artist's fan community.
-      The diversity multiplier rewards songs reaching multiple distinct audience types.
+      The diversity multiplier rewards songs reaching multiple distinct audience types.</span>
+      <span id="method-velocity" style="display:none">Songs are ranked by <strong>daily stream % increase</strong> —
+      how much their Spotify play count grew today vs. the prior snapshot.
+      Adjust the minimum daily streams threshold in the sidebar to filter noise.</span>
     </div>
   </div>
-  <div class="chart-cols">
+  <div class="chart-cols" id="cols-crossover">
     <span></span><span>Song</span><span>Reach</span><span style="text-align:right">Week</span>
+  </div>
+  <div class="chart-cols" id="cols-velocity" style="display:none;grid-template-columns:30px 1fr 90px 90px">
+    <span></span><span>Song</span><span style="text-align:right">% Today</span><span style="text-align:right">Daily Streams</span>
   </div>
   <div id="chart-rows"></div>
 </div>
@@ -636,9 +692,18 @@ button{{cursor:pointer;font-family:inherit}}
 </div>
 <script>
 const SONGS = {songs_js};
+const VELOCITY = {velocity_js};
 let openIdx = null;
+let activeTab = 'crossover';
 
-function renderChart() {{
+function fmt(n) {{
+  if (n === null || n === undefined) return '—';
+  return n >= 1000000 ? (n/1000000).toFixed(1)+'M'
+       : n >= 1000    ? (n/1000).toFixed(1)+'K'
+       : String(n);
+}}
+
+function renderCrossover() {{
   const wrap = document.getElementById('chart-rows');
   wrap.innerHTML = '';
   SONGS.forEach((s, i) => {{
@@ -712,6 +777,55 @@ function renderChart() {{
   }});
 }}
 
+function renderVelocity() {{
+  const wrap = document.getElementById('chart-rows');
+  wrap.innerHTML = '';
+  if (!VELOCITY.length) {{
+    wrap.innerHTML = '<div style="padding:24px;font-family:var(--mono);font-size:11px;color:var(--ink3)">No stream velocity data — run the Spotify collector first.</div>';
+    return;
+  }}
+  const maxPct = VELOCITY[0].pct_increase;
+  VELOCITY.forEach((v, i) => {{
+    const pct = parseFloat(v.pct_increase);
+    const barW = Math.round(pct / maxPct * 100);
+    const row = document.createElement('div');
+    row.className = 'srow';
+    row.style.gridTemplateColumns = '30px 1fr 90px 90px';
+    row.innerHTML = `
+      <div class="srank ${{i < 3 ? 't' : ''}}">${{i+1}}</div>
+      <div>
+        <div class="stitle">${{v.title}}</div>
+        <div class="sartist">${{v.artist_name}}</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-family:var(--serif);font-size:15px;color:var(--green)">${{pct.toFixed(1)}}%</div>
+        <div class="spen-bar" style="margin-top:4px"><div class="spen-fill" style="width:${{barW}}%;background:var(--green)"></div></div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink3)">vs prior day</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-family:var(--serif);font-size:15px">${{fmt(v.delta)}}</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--ink3)">${{fmt(v.total)}} total</div>
+      </div>
+    `;
+    wrap.appendChild(row);
+  }});
+}}
+
+function switchTab(tab) {{
+  activeTab = tab;
+  document.getElementById('tab-crossover').classList.toggle('on', tab === 'crossover');
+  document.getElementById('tab-velocity').classList.toggle('on', tab === 'velocity');
+  document.getElementById('cols-crossover').style.display = tab === 'crossover' ? '' : 'none';
+  document.getElementById('cols-velocity').style.display  = tab === 'velocity'  ? '' : 'none';
+  document.getElementById('chart-desc').textContent = tab === 'crossover'
+    ? 'Out-of-home penetration score · {window_days}-day rolling window'
+    : 'Daily stream % increase · vs prior Spotify snapshot';
+  document.getElementById('method-crossover').style.display = tab === 'crossover' ? '' : 'none';
+  document.getElementById('method-velocity').style.display  = tab === 'velocity'  ? '' : 'none';
+  if (tab === 'crossover') renderCrossover();
+  else renderVelocity();
+}}
+
 function toggle(i, s) {{
   const el = document.getElementById('exp-' + i);
   if (el.classList.contains('open')) {{
@@ -729,7 +843,7 @@ function toggleMethod() {{
   b.style.display = b.style.display === 'block' ? 'none' : 'block';
 }}
 
-renderChart();
+renderCrossover();
 </script>
 </body>
 </html>"""
@@ -738,6 +852,7 @@ renderChart();
 
 df_raw = load_signals(window_days)
 prev_scores = load_prev_scores(window_days)
+df_velocity = load_stream_velocity(min_stream_delta)
 
 if df_raw.empty:
     st.warning("No signal events found for this window. Try increasing the window size.")
@@ -765,7 +880,12 @@ with stats_placeholder:
 # ── Editorial chart ────────────────────────────────────────────────────────────
 
 songs_data = build_songs_data(scored, df_raw, prev_scores, chart_size)
-chart_html = render_chart_html(songs_data, window_days)
+velocity_data = df_velocity.to_dict(orient="records") if not df_velocity.empty else []
+for v in velocity_data:
+    v["pct_increase"] = float(v["pct_increase"]) if v["pct_increase"] is not None else 0.0
+    v["delta"] = int(v["delta"]) if v["delta"] is not None else 0
+    v["total"] = int(v["total"]) if v["total"] is not None else 0
+chart_html = render_chart_html(songs_data, window_days, velocity=velocity_data)
 components.html(chart_html, height=300 + chart_size * 80, scrolling=True)
 
 # ── Raw signal explorer ───────────────────────────────────────────────────────
