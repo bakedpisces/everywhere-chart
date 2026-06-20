@@ -434,7 +434,7 @@ def build_songs_data(scored: pd.DataFrame, df_raw: pd.DataFrame,
     return songs
 
 
-def render_chart_html(songs: list, window_days: int, velocity: list | None = None) -> str:
+def render_chart_html(songs: list, window_days: int, velocity=None) -> str:
     end_dt   = date.today()
     start_dt = end_dt - timedelta(days=window_days)
     date_lbl = f"{start_dt.strftime('%b %-d')} – {end_dt.strftime('%-d, %Y')}"
