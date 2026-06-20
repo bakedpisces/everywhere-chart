@@ -885,6 +885,8 @@ for v in velocity_data:
     v["pct_increase"] = float(v["pct_increase"]) if v["pct_increase"] is not None else 0.0
     v["delta"] = int(v["delta"]) if v["delta"] is not None else 0
     v["total"] = int(v["total"]) if v["total"] is not None else 0
+    v["obs_date"] = str(v["obs_date"]) if v.get("obs_date") is not None else ""
+    v["prev_total"] = int(v["prev_total"]) if v.get("prev_total") is not None else 0
 chart_html = render_chart_html(songs_data, window_days, velocity=velocity_data)
 components.html(chart_html, height=300 + chart_size * 80, scrolling=True)
 
