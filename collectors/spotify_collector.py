@@ -59,7 +59,7 @@ CHARTS_TO_FETCH = [
 INTENTIONALITY_CHART_POSITION = 0.15
 
 # Max artist pages to load per run for play-count scraping (each ~5-10s)
-MAX_ARTIST_STREAM_FETCHES = 30
+MAX_ARTIST_STREAM_FETCHES = 100
 
 # ── Chart fetching ────────────────────────────────────────────────────────────
 
@@ -686,10 +686,16 @@ def run(snapshot_date: date = None):
                 SELECT DISTINCT a.spotify_artist_id
                 FROM songs s
                 JOIN artists a ON a.id = s.artist_id
+                LEFT JOIN (
+                    SELECT song_id, MAX(observed_at) AS last_stream
+                    FROM signal_events
+                    WHERE signal_type = 'stream_count'
+                    GROUP BY song_id
+                ) ls ON ls.song_id = s.id
                 WHERE s.under_radar = TRUE
                   AND a.spotify_artist_id IS NOT NULL
                   AND a.spotify_artist_id NOT LIKE 'unknown_%%'
-                ORDER BY a.spotify_artist_id
+                ORDER BY ls.last_stream ASC NULLS FIRST
                 LIMIT %s
             """, (MAX_ARTIST_STREAM_FETCHES,))
             under_radar_artist_ids = [r["spotify_artist_id"] for r in cur.fetchall()]
