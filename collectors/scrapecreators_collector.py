@@ -42,7 +42,11 @@ SC_API_KEY = os.environ.get("SCRAPECREATORS_API_KEY", "")
 SC_BASE    = "https://api.scrapecreators.com"
 
 MAX_SONGS           = 500    # songs per run (2 credits each = 1000 credits/day)
-RECHECK_DAYS        = 7      # reprocess songs after this many days
+
+# Tiered recheck windows — faster for songs likely to be moving
+RECHECK_DAYS_HOT    = 3      # under-radar songs
+RECHECK_DAYS_ACTIVE = 5      # songs with recent signals on any platform
+RECHECK_DAYS_COLD   = 14     # quiet catalog
 MIN_TT_USER_COUNT   = 10     # ignore TikTok sounds with fewer videos
 TT_MATCH_THRESHOLD  = 0.40   # token-overlap score to accept a TikTok sound
 YT_MATCH_THRESHOLD  = 0.35   # slightly looser — video titles have more noise
@@ -261,20 +265,23 @@ def _check_fatal(resp: requests.Response, context: str):
 
 def load_songs(cur, limit: int) -> list[dict]:
     """
-    Songs that haven't had any ScrapeCreators lookup in the last RECHECK_DAYS.
-
-    Priority order:
-      1. Under-radar songs (new + UGC playlist + not on Spotify chart)
-      2. Top songs — on a Spotify or Shazam chart right now
-      3. Everything else (catalog songs with some signals, or none)
-         sorted by playlist follower count so the most-playlisted come first
+    Tiered recheck windows — songs likely to be moving get checked more often:
+      - Under-radar songs:          every RECHECK_DAYS_HOT    days
+      - Songs with recent activity: every RECHECK_DAYS_ACTIVE days
+      - Cold catalog:               every RECHECK_DAYS_COLD   days
     """
-    cur.execute(f"""
+    cur.execute("""
         WITH last_sc AS (
             SELECT song_id, MAX(observed_at) AS last_at
             FROM signal_events
             WHERE external_id LIKE 'sc_%%'
             GROUP BY song_id
+        ),
+        recent_activity AS (
+            SELECT DISTINCT song_id
+            FROM signal_events
+            WHERE observed_at >= NOW() - INTERVAL '14 days'
+              AND source_platform IN ('spotify', 'shazam', 'tiktok', 'youtube', 'press')
         ),
         on_chart AS (
             SELECT DISTINCT song_id
@@ -292,20 +299,32 @@ def load_songs(cur, limit: int) -> list[dict]:
             s.under_radar,
             s.release_date,
             s.playlist_follower_count,
-            (oc.song_id IS NOT NULL) AS on_chart
+            (oc.song_id IS NOT NULL)  AS on_chart,
+            (ra.song_id IS NOT NULL)  AS has_recent_activity
         FROM songs s
         JOIN artists a ON a.id = s.artist_id
         LEFT JOIN last_sc lc ON lc.song_id = s.id
+        LEFT JOIN recent_activity ra ON ra.song_id = s.id
         LEFT JOIN on_chart oc ON oc.song_id = s.id
         WHERE lc.song_id IS NULL
-           OR lc.last_at < NOW() - INTERVAL '{RECHECK_DAYS} days'
+           OR (s.under_radar = TRUE
+               AND lc.last_at < NOW() - INTERVAL %(hot)s)
+           OR (ra.song_id IS NOT NULL
+               AND lc.last_at < NOW() - INTERVAL %(active)s)
+           OR lc.last_at < NOW() - INTERVAL %(cold)s
         ORDER BY
-            s.under_radar DESC,                          -- tier 1: under-radar
-            (oc.song_id IS NOT NULL) DESC,               -- tier 2: charting songs
-            s.playlist_follower_count DESC NULLS LAST,   -- tier 3: by playlist reach
+            s.under_radar DESC,
+            (oc.song_id IS NOT NULL) DESC,
+            (ra.song_id IS NOT NULL) DESC,
+            s.playlist_follower_count DESC NULLS LAST,
             s.created_at DESC
-        LIMIT %s
-    """, (limit,))
+        LIMIT %(limit)s
+    """, {
+        "hot":    f"{RECHECK_DAYS_HOT} days",
+        "active": f"{RECHECK_DAYS_ACTIVE} days",
+        "cold":   f"{RECHECK_DAYS_COLD} days",
+        "limit":  limit,
+    })
     return cur.fetchall()
 
 
@@ -420,8 +439,13 @@ def run():
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         songs = load_songs(cur, MAX_SONGS)
 
-    log.info(f"ScrapeCreators collector: {len(songs)} songs to process "
-             f"(~{len(songs) * 2} credits)")
+    hot    = sum(1 for s in songs if s["under_radar"])
+    active = sum(1 for s in songs if not s["under_radar"] and s["has_recent_activity"])
+    cold   = len(songs) - hot - active
+    log.info(
+        f"ScrapeCreators collector: {len(songs)} songs to process "
+        f"(hot={hot} active={active} cold={cold}, ~{len(songs) * 2} credits)"
+    )
 
     tt_hits = tt_misses = yt_hits = yt_misses = errors = 0
 
