@@ -65,6 +65,16 @@ MAX_PLAYLISTS_PER_RUN = 50    # cap total playlists seeded per run
 # Spotify user IDs that own editorial / official playlists
 EDITORIAL_OWNERS = {"spotify", "spotifycharts"}
 
+# Feasibility probe: can our user token read Spotify-OWNED editorial playlist
+# tracklists? (Spotify restricted this for client-credentials apps in 2024.)
+# Runs once at the top of each seeder run and logs the result; does not affect
+# the rest of the run. Remove once the editorial-watchlist model is settled.
+EDITORIAL_PROBE = {
+    "Today's Top Hits":  "37i9dQZF1DXcBWIGoYBM5M",
+    "Top 50 - Global":   "37i9dQZEVXbMDoHDwVN2tF",
+    "RapCaviar":         "37i9dQZF1DX0XUsuxWHRQd",
+}
+
 # Songs released within this window are considered "new"
 UNDER_RADAR_RELEASE_DAYS = 60
 
@@ -693,6 +703,40 @@ def write_playlist_reach_signals(conn):
     log.info(f"Playlist reach signals: {written} written for {len(songs)} playlisted songs")
 
 
+def probe_editorial_access():
+    """One-shot feasibility test for the editorial-watchlist crossover model.
+    Reads metadata + tracklist for a few Spotify-owned editorial playlists and
+    logs whether our token can see them. Purely diagnostic."""
+    log.info("── Editorial read probe ──────────────────────────────────")
+    if not _has_user_token():
+        log.warning("EDITORIAL PROBE: no user token — skipping (would be inconclusive)")
+        return
+    ok = 0
+    for name, pid in EDITORIAL_PROBE.items():
+        meta = _get(f"https://api.spotify.com/v1/playlists/{pid}",
+                    params={"fields": "name,owner(id),followers(total)"})
+        if not meta:
+            log.warning(f"EDITORIAL PROBE: {name} ({pid}) — metadata read FAILED "
+                        f"(403/404/None) — editorial access likely blocked")
+            continue
+        owner = (meta.get("owner") or {}).get("id")
+        fol   = (meta.get("followers") or {}).get("total")
+        tracks = fetch_playlist_tracks(pid)
+        if tracks:
+            ok += 1
+            log.info(f"EDITORIAL PROBE: ✓ {name} — owner={owner} "
+                     f"followers={fol:,} — read {len(tracks)} tracks "
+                     f"(e.g. '{tracks[0]['title']}' — {tracks[0]['artist']})")
+        else:
+            log.warning(f"EDITORIAL PROBE: {name} — metadata OK (owner={owner}) but "
+                        f"TRACKLIST read returned 0 — tracks likely restricted")
+    verdict = ("READABLE — editorial-watchlist model is viable"
+               if ok == len(EDITORIAL_PROBE)
+               else f"PARTIAL/BLOCKED — {ok}/{len(EDITORIAL_PROBE)} readable")
+    log.info(f"EDITORIAL PROBE VERDICT: {verdict}")
+    log.info("──────────────────────────────────────────────────────────")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run(user_token: Optional[str] = None, conn=None):
@@ -730,6 +774,9 @@ def run(user_token: Optional[str] = None, conn=None):
             "track fetching will likely 403. To fix: ensure SPOTIFY_SP_DC is set "
             "or the Spotify collector's Playwright session is providing a token."
         )
+
+    # One-shot feasibility test for the editorial-watchlist crossover model.
+    probe_editorial_access()
 
     # ── Build artist name filter set ─────────────────────────────────────────
     with conn.cursor() as cur:
