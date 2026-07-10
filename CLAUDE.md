@@ -16,8 +16,11 @@ across communities far from a song's home fanbase.
 | shazam | (Nixpacks) | every 6h | Shazam trending charts via RapidAPI |
 | youtube | (Nixpacks) | daily | YouTube trending charts |
 | press | (Nixpacks) | every 6h | Google News RSS + fixed publication feeds |
-| reddit | (Nixpacks) | dormant | Blocked by Railway IPs; OAuth code ready, awaiting credentials |
 | tiktok | `Dockerfile.tiktok` | dormant | Replaced by ScrapeCreators for TikTok data |
+
+Reddit collector code stays in the repo (`reddit_collector.py`) but the Railway
+service is deleted — Reddit blocks Railway IPs and self-serve API app creation is
+gone. Re-provision only if API access is granted.
 
 ### Database
 PostgreSQL on Railway. Extensions: `pg_trgm`, `unaccent`.
@@ -103,6 +106,14 @@ Password: set in `APP_PASSWORD` env var (default: `civilwar`).
 | `playlist_reach` | spotify | daily follower-weighted playlist signal |
 
 ## Key gotchas & hard-won knowledge
+
+### Signal retention (critical — a full volume crashes Postgres)
+- `enforce_retention()` runs at the START of the Spotify collector each day
+- `playlist_reach` capped at 14 days (~7-8k rows/day — the main space hog)
+- All other signal types capped at 60 days
+- Uses per-type DELETEs, not one big DELETE, to avoid WAL spikes
+- **Never run manual `VACUUM FULL`/`VACUUM` on Railway** — it needs free disk to write temp files; on a near-full volume it fills the disk and crashes the DB into an unrecoverable WAL loop (this happened July 2026, required wiping the volume). Let autovacuum handle reclaim.
+- Railway Postgres volume is 500 MB on the base plan; a full volume cannot finish crash recovery
 
 ### Railway deployments
 - Services with `Dockerfile.*` use that file; others use Nixpacks auto-detection

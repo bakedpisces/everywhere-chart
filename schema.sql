@@ -182,7 +182,8 @@ CREATE TABLE signal_events (
     signal_type             TEXT NOT NULL CHECK (signal_type IN (
                                 'mention','post','comment','save','share',
                                 'sound_use','shazam','playlist_add',
-                                'chart_position','upvote'
+                                'chart_position','upvote',
+                                'stream_count','playlist_reach'
                             )),
 
     -- intentionality

@@ -660,12 +660,49 @@ def upsert_artist_community(cur, subreddit: str, artist_id: str):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+# Rolling retention — keep the DB from filling up its volume.
+# playlist_reach is a daily follower snapshot (~7-8k rows/day) so it's capped
+# tight; other signal types keep a longer window for the scoring lookback.
+RETENTION_PLAYLIST_REACH_DAYS = 14
+RETENTION_DEFAULT_DAYS        = 60
+
+
+def enforce_retention(conn):
+    """Delete aged-out signal_events. Runs daily at the start of the Spotify
+    collector (the first collector each day). Uses small, per-type DELETEs to
+    avoid a single massive WAL spike."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM signal_events "
+            "WHERE signal_type = 'playlist_reach' "
+            "  AND observed_at < NOW() - INTERVAL %s",
+            (f"{RETENTION_PLAYLIST_REACH_DAYS} days",),
+        )
+        reach_deleted = cur.rowcount
+        cur.execute(
+            "DELETE FROM signal_events "
+            "WHERE signal_type <> 'playlist_reach' "
+            "  AND observed_at < NOW() - INTERVAL %s",
+            (f"{RETENTION_DEFAULT_DAYS} days",),
+        )
+        other_deleted = cur.rowcount
+    conn.commit()
+    log.info(
+        f"Retention: pruned {reach_deleted:,} playlist_reach "
+        f"(>{RETENTION_PLAYLIST_REACH_DAYS}d) + {other_deleted:,} other "
+        f"(>{RETENTION_DEFAULT_DAYS}d) signal_events"
+    )
+
+
 def run(snapshot_date: date = None):
     snapshot_date = snapshot_date or date.today()
 
     conn = psycopg2.connect(DB_URL)
     conn.autocommit = False
     psycopg2.extras.register_uuid()
+
+    # Prune aged-out signals before writing new ones.
+    enforce_retention(conn)
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("""
