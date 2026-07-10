@@ -720,7 +720,8 @@ def run(snapshot_date: date = None):
         # fetch their play counts in the same browser session.
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT DISTINCT a.spotify_artist_id
+                SELECT a.spotify_artist_id,
+                       MIN(ls.last_stream) AS last_stream
                 FROM songs s
                 JOIN artists a ON a.id = s.artist_id
                 LEFT JOIN (
@@ -732,7 +733,8 @@ def run(snapshot_date: date = None):
                 WHERE s.under_radar = TRUE
                   AND a.spotify_artist_id IS NOT NULL
                   AND a.spotify_artist_id NOT LIKE 'unknown_%%'
-                ORDER BY ls.last_stream ASC NULLS FIRST
+                GROUP BY a.spotify_artist_id
+                ORDER BY MIN(ls.last_stream) ASC NULLS FIRST
                 LIMIT %s
             """, (MAX_ARTIST_STREAM_FETCHES,))
             under_radar_artist_ids = [r["spotify_artist_id"] for r in cur.fetchall()]
