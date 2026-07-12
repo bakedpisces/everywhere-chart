@@ -115,6 +115,24 @@ Password: set in `APP_PASSWORD` env var (default: `civilwar`).
 - **Never run manual `VACUUM FULL`/`VACUUM` on Railway** — it needs free disk to write temp files; on a near-full volume it fills the disk and crashes the DB into an unrecoverable WAL loop (this happened July 2026, required wiping the volume). Let autovacuum handle reclaim.
 - Railway Postgres volume is 500 MB on the base plan; a full volume cannot finish crash recovery
 
+### Spotify auth — two separate token worlds (learned the hard way, July 2026)
+Spotify stopped honoring **web-player tokens** (from the sp_dc cookie) on the
+public Web API (`api.spotify.com/v1`) — they now 404 on search and playlist
+reads. So there are two distinct token paths, and you must use the right one:
+- **Web-player token** (sp_dc via Playwright) → valid ONLY for web-player-internal
+  APIs: the charts endpoint and `api-partner.../pathfinder` (artist stream counts).
+  This is what `spotify_collector` uses. Still works.
+- **OAuth user token** (Authorization Code refresh grant, `SPOTIFY_REFRESH_TOKEN`)
+  → the ONLY token that reads playlist search + tracks on the Web API. This is
+  what the **seeder** uses via `get_token()`.
+- **Client-credentials** → can `/v1/search` but 403s on playlist track reads. Only
+  a degraded fallback; the enricher still uses it for basic track/artist/album reads.
+
+To (re)issue the refresh token: `python scripts/spotify_oauth_setup.py auth`, then
+`... exchange "<redirect url>"`. The authorizing account MUST be on the app's
+Development-Mode user allowlist (developer.spotify.com → app → User Management),
+or Web API calls 403 with "user not registered for this application".
+
 ### Railway deployments
 - Services with `Dockerfile.*` use that file; others use Nixpacks auto-detection
 - Nixpacks reads `requirements.txt` — **do not put `playwright` in requirements.txt** (greenlet C++ build fails). Only `Dockerfile.spotify` installs playwright explicitly
@@ -158,8 +176,9 @@ Fetches label via `/v1/albums/{album_id}?fields=label`.
 | Var | Used by |
 |-----|---------|
 | `DATABASE_URL` | all services |
-| `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | spotify_collector, enricher |
-| `SPOTIFY_SP_DC` | spotify_collector (user session cookie for Playwright) |
+| `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | spotify_collector, enricher, seeder |
+| `SPOTIFY_SP_DC` | spotify_collector (Playwright: charts + pathfinder stream counts) |
+| `SPOTIFY_REFRESH_TOKEN` | seeder (OAuth user token for playlist search + track reads) |
 | `RAPIDAPI_KEY` | shazam_collector |
 | `SCRAPECREATORS_API_KEY` | scrapecreators_collector |
 | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` / `REDDIT_USERNAME` | reddit_collector (dormant) |
