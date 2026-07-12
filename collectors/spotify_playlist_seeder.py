@@ -703,25 +703,32 @@ def write_playlist_reach_signals(conn):
     log.info(f"Playlist reach signals: {written} written for {len(songs)} playlisted songs")
 
 
-def probe_editorial_access():
+def probe_editorial_access(conn=None):
     """One-shot feasibility test for the editorial-watchlist crossover model.
     Reads metadata + tracklist for a few Spotify-owned editorial playlists and
-    logs whether our token can see them. Purely diagnostic."""
+    logs whether our token can see them. Also persists the verdict to
+    collector_runs so it can be read without Railway log access. Diagnostic only."""
     log.info("── Editorial read probe ──────────────────────────────────")
+    results = {}
     if not _has_user_token():
         log.warning("EDITORIAL PROBE: no user token — skipping (would be inconclusive)")
+        _persist_probe(conn, "skipped", {"reason": "no_user_token"})
         return
+
     ok = 0
     for name, pid in EDITORIAL_PROBE.items():
         meta = _get(f"https://api.spotify.com/v1/playlists/{pid}",
                     params={"fields": "name,owner(id),followers(total)"})
         if not meta:
             log.warning(f"EDITORIAL PROBE: {name} ({pid}) — metadata read FAILED "
-                        f"(403/404/None) — editorial access likely blocked")
+                        f"(403/404/429/None) — editorial access likely blocked")
+            results[name] = {"pid": pid, "meta": False, "tracks": 0}
             continue
         owner = (meta.get("owner") or {}).get("id")
         fol   = (meta.get("followers") or {}).get("total")
         tracks = fetch_playlist_tracks(pid)
+        results[name] = {"pid": pid, "meta": True, "owner": owner,
+                         "followers": fol, "tracks": len(tracks)}
         if tracks:
             ok += 1
             log.info(f"EDITORIAL PROBE: ✓ {name} — owner={owner} "
@@ -730,11 +737,35 @@ def probe_editorial_access():
         else:
             log.warning(f"EDITORIAL PROBE: {name} — metadata OK (owner={owner}) but "
                         f"TRACKLIST read returned 0 — tracks likely restricted")
-    verdict = ("READABLE — editorial-watchlist model is viable"
-               if ok == len(EDITORIAL_PROBE)
-               else f"PARTIAL/BLOCKED — {ok}/{len(EDITORIAL_PROBE)} readable")
+
+    total = len(EDITORIAL_PROBE)
+    if ok == total:
+        status, verdict = "success", "READABLE — editorial-watchlist model is viable"
+    elif ok > 0:
+        status, verdict = "partial", f"PARTIAL — {ok}/{total} readable"
+    else:
+        status, verdict = "failed", f"BLOCKED — 0/{total} readable"
     log.info(f"EDITORIAL PROBE VERDICT: {verdict}")
     log.info("──────────────────────────────────────────────────────────")
+    _persist_probe(conn, status, {"verdict": verdict, "readable": ok,
+                                  "total": total, "results": results})
+
+
+def _persist_probe(conn, status: str, metadata: dict):
+    """Write the probe outcome to collector_runs so it's readable from the DB."""
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO collector_runs (collector, status, completed_at, metadata)
+                VALUES ('editorial_probe', %s, NOW(), %s)
+            """, (status if status in ('success', 'partial', 'failed') else 'partial',
+                  psycopg2.extras.Json(metadata)))
+        conn.commit()
+    except Exception as e:
+        log.warning(f"EDITORIAL PROBE: could not persist verdict: {e}")
+        conn.rollback()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -776,7 +807,7 @@ def run(user_token: Optional[str] = None, conn=None):
         )
 
     # One-shot feasibility test for the editorial-watchlist crossover model.
-    probe_editorial_access()
+    probe_editorial_access(conn)
 
     # ── Build artist name filter set ─────────────────────────────────────────
     with conn.cursor() as cur:
