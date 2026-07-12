@@ -138,6 +138,7 @@ def get_token() -> Optional[str]:
                 if token:
                     _token_cache["access_token"] = token
                     _token_cache["expires_at"]   = expires_ms / 1000 if expires_ms else now + 3600
+                    _token_cache["source"]       = "sp_dc_user"
                     log.info("Using sp_dc user token")
                     return token
         except Exception as e:
@@ -158,6 +159,7 @@ def get_token() -> Optional[str]:
         data = resp.json()
         _token_cache["access_token"] = data["access_token"]
         _token_cache["expires_at"]   = now + data["expires_in"]
+        _token_cache["source"]       = "client_credentials"
         log.warning(
             "Using client credentials token — playlist TRACK fetching will 403. "
             "Provide SPOTIFY_SP_DC or inject a user token to seed tracks."
@@ -710,9 +712,22 @@ def probe_editorial_access(conn=None):
     collector_runs so it can be read without Railway log access. Diagnostic only."""
     log.info("── Editorial read probe ──────────────────────────────────")
     results = {}
-    if not _has_user_token():
-        log.warning("EDITORIAL PROBE: no user token — skipping (would be inconclusive)")
-        _persist_probe(conn, "skipped", {"reason": "no_user_token"})
+
+    # Force token acquisition and check what we ACTUALLY got. The sp_dc web
+    # endpoint is Akamai-blocked from datacenter IPs, so the only real user
+    # token in prod is the Playwright-injected one. Client-credentials tokens
+    # get 404 on editorial playlists by design — testing on them is a false
+    # negative, so we bail as INCONCLUSIVE rather than reporting BLOCKED.
+    get_token()
+    source = _token_cache.get("source", "unknown")
+    if source != "injected_user":
+        log.warning(f"EDITORIAL PROBE: token source is '{source}', not a real user "
+                    f"token — result would be a false negative. Marking INCONCLUSIVE. "
+                    f"(Needs the Playwright-injected token from spotify_collector.)")
+        _persist_probe(conn, "partial",
+                       {"verdict": f"INCONCLUSIVE — token source '{source}'",
+                        "token_source": source})
+        log.info("──────────────────────────────────────────────────────────")
         return
 
     ok = 0
@@ -748,7 +763,8 @@ def probe_editorial_access(conn=None):
     log.info(f"EDITORIAL PROBE VERDICT: {verdict}")
     log.info("──────────────────────────────────────────────────────────")
     _persist_probe(conn, status, {"verdict": verdict, "readable": ok,
-                                  "total": total, "results": results})
+                                  "total": total, "token_source": "injected_user",
+                                  "results": results})
 
 
 def _persist_probe(conn, status: str, metadata: dict):
@@ -786,6 +802,7 @@ def run(user_token: Optional[str] = None, conn=None):
         _token_cache["injected_token"] = user_token
         _token_cache["access_token"]   = user_token
         _token_cache["expires_at"]     = time.time() + 3600
+        _token_cache["source"]         = "injected_user"
         log.info("Playlist seeder: using injected user token from Spotify collector")
     else:
         log.info("Playlist seeder: no injected token — will attempt sp_dc / client credentials")
