@@ -40,10 +40,15 @@ from typing import Optional
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("spotify_playlist_seeder")
 
-DB_URL         = os.environ["DATABASE_URL"]
-SPOTIFY_CLIENT = os.environ.get("SPOTIFY_CLIENT_ID")
-SPOTIFY_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET")
-SPOTIFY_SP_DC  = os.environ.get("SPOTIFY_SP_DC")
+DB_URL          = os.environ["DATABASE_URL"]
+SPOTIFY_CLIENT  = os.environ.get("SPOTIFY_CLIENT_ID")
+SPOTIFY_SECRET  = os.environ.get("SPOTIFY_CLIENT_SECRET")
+SPOTIFY_SP_DC   = os.environ.get("SPOTIFY_SP_DC")
+# User OAuth (Authorization Code) refresh token — the only token class Spotify
+# still honors for reading playlist search + tracks via the Web API. Obtain via
+# scripts/spotify_oauth_setup.py. Requires the authorizing account to be on the
+# app's Development-Mode user allowlist.
+SPOTIFY_REFRESH_TOKEN = os.environ.get("SPOTIFY_REFRESH_TOKEN")
 
 SEARCH_KEYWORDS       = [
     "new music 2025",
@@ -64,16 +69,6 @@ MAX_PLAYLISTS_PER_RUN = 50    # cap total playlists seeded per run
 
 # Spotify user IDs that own editorial / official playlists
 EDITORIAL_OWNERS = {"spotify", "spotifycharts"}
-
-# Feasibility probe: can our user token read Spotify-OWNED editorial playlist
-# tracklists? (Spotify restricted this for client-credentials apps in 2024.)
-# Runs once at the top of each seeder run and logs the result; does not affect
-# the rest of the run. Remove once the editorial-watchlist model is settled.
-EDITORIAL_PROBE = {
-    "Today's Top Hits":  "37i9dQZF1DXcBWIGoYBM5M",
-    "Top 50 - Global":   "37i9dQZEVXbMDoHDwVN2tF",
-    "RapCaviar":         "37i9dQZF1DX0XUsuxWHRQd",
-}
 
 # Songs released within this window are considered "new"
 UNDER_RADAR_RELEASE_DAYS = 60
@@ -110,41 +105,41 @@ _token_cache: dict = {}
 def get_token() -> Optional[str]:
     """
     Priority:
-      1. Injected user token (from Spotify collector's Playwright session)
-      2. sp_dc session cookie → user-level token via web endpoint
-      3. Client credentials (can discover playlists but NOT read their tracks)
+      1. OAuth refresh token (Authorization Code) → user token valid for the
+         Web API. The only token class Spotify still honors for reading playlist
+         search + tracks. Requires SPOTIFY_REFRESH_TOKEN + client id/secret.
+      2. Client credentials — search works, but playlist TRACK reads 403.
+
+    The old sp_dc / web-player-token path is gone: Spotify stopped honoring
+    web-player tokens on api.spotify.com/v1 (they 404 on search and playlists).
     """
     now = time.time()
     if _token_cache.get("expires_at", 0) > now + 30:
         return _token_cache["access_token"]
 
-    # Try sp_dc
-    if SPOTIFY_SP_DC:
+    # 1. OAuth refresh token → user access token (valid for the Web API)
+    if SPOTIFY_REFRESH_TOKEN and SPOTIFY_CLIENT and SPOTIFY_SECRET:
         try:
-            resp = requests.get(
-                "https://open.spotify.com/get_access_token",
-                params={"reason": "transport", "productType": "web_player"},
-                cookies={"sp_dc": SPOTIFY_SP_DC},
-                headers={"User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                )},
+            resp = requests.post(
+                "https://accounts.spotify.com/api/token",
+                data={"grant_type": "refresh_token",
+                      "refresh_token": SPOTIFY_REFRESH_TOKEN},
+                auth=(SPOTIFY_CLIENT, SPOTIFY_SECRET),
                 timeout=10,
             )
             if resp.status_code == 200:
                 data = resp.json()
-                token = data.get("accessToken")
-                expires_ms = data.get("accessTokenExpirationTimestampMs", 0)
-                if token:
-                    _token_cache["access_token"] = token
-                    _token_cache["expires_at"]   = expires_ms / 1000 if expires_ms else now + 3600
-                    _token_cache["source"]       = "sp_dc_user"
-                    log.info("Using sp_dc user token")
-                    return token
+                _token_cache["access_token"] = data["access_token"]
+                _token_cache["expires_at"]   = now + data.get("expires_in", 3600)
+                _token_cache["source"]       = "oauth_user"
+                log.info("Using OAuth user token (refresh grant)")
+                return _token_cache["access_token"]
+            log.warning(f"Refresh-token grant failed ({resp.status_code}): "
+                        f"{resp.text[:120]} — falling back to client credentials")
         except Exception as e:
-            log.warning(f"sp_dc token failed: {e} — falling back to client credentials")
+            log.warning(f"Refresh-token grant error: {e} — falling back to client credentials")
 
-    # Client credentials fallback
+    # 2. Client credentials fallback (search only; track reads 403)
     if not SPOTIFY_CLIENT or not SPOTIFY_SECRET:
         log.error("No SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET — cannot get token")
         return None
@@ -161,8 +156,8 @@ def get_token() -> Optional[str]:
         _token_cache["expires_at"]   = now + data["expires_in"]
         _token_cache["source"]       = "client_credentials"
         log.warning(
-            "Using client credentials token — playlist TRACK fetching will 403. "
-            "Provide SPOTIFY_SP_DC or inject a user token to seed tracks."
+            "Using client credentials token — playlist TRACK reads will 403. "
+            "Set SPOTIFY_REFRESH_TOKEN (see scripts/spotify_oauth_setup.py) to seed tracks."
         )
         return _token_cache["access_token"]
     except Exception as e:
@@ -194,10 +189,8 @@ def _get(url: str, params: dict = None) -> Optional[dict]:
                 time.sleep(wait)
                 continue
             if resp.status_code == 401:
-                injected = _token_cache.get("injected_token")
+                # Access token expired mid-run — clear cache and re-mint.
                 _token_cache.clear()
-                if injected:
-                    log.warning("Injected user token returned 401 — falling back to client credentials")
                 token = get_token()
                 if not token:
                     return None
@@ -217,8 +210,8 @@ def _get(url: str, params: dict = None) -> Optional[dict]:
 
 
 def _has_user_token() -> bool:
-    """True if current token is user-level (can read playlist tracks)."""
-    return bool(_token_cache.get("injected_token") or SPOTIFY_SP_DC)
+    """True if we can obtain a Web-API user token (can read playlist tracks)."""
+    return bool(SPOTIFY_REFRESH_TOKEN or _token_cache.get("source") == "oauth_user")
 
 
 def _contains_artist_name(pl_name: str, artist_names: frozenset) -> bool:
@@ -705,85 +698,6 @@ def write_playlist_reach_signals(conn):
     log.info(f"Playlist reach signals: {written} written for {len(songs)} playlisted songs")
 
 
-def probe_editorial_access(conn=None):
-    """One-shot feasibility test for the editorial-watchlist crossover model.
-    Reads metadata + tracklist for a few Spotify-owned editorial playlists and
-    logs whether our token can see them. Also persists the verdict to
-    collector_runs so it can be read without Railway log access. Diagnostic only."""
-    log.info("── Editorial read probe ──────────────────────────────────")
-    results = {}
-
-    # Force token acquisition and check what we ACTUALLY got. The sp_dc web
-    # endpoint is Akamai-blocked from datacenter IPs, so the only real user
-    # token in prod is the Playwright-injected one. Client-credentials tokens
-    # get 404 on editorial playlists by design — testing on them is a false
-    # negative, so we bail as INCONCLUSIVE rather than reporting BLOCKED.
-    get_token()
-    source = _token_cache.get("source", "unknown")
-    if source != "injected_user":
-        log.warning(f"EDITORIAL PROBE: token source is '{source}', not a real user "
-                    f"token — result would be a false negative. Marking INCONCLUSIVE. "
-                    f"(Needs the Playwright-injected token from spotify_collector.)")
-        _persist_probe(conn, "partial",
-                       {"verdict": f"INCONCLUSIVE — token source '{source}'",
-                        "token_source": source})
-        log.info("──────────────────────────────────────────────────────────")
-        return
-
-    ok = 0
-    for name, pid in EDITORIAL_PROBE.items():
-        meta = _get(f"https://api.spotify.com/v1/playlists/{pid}",
-                    params={"fields": "name,owner(id),followers(total)"})
-        if not meta:
-            log.warning(f"EDITORIAL PROBE: {name} ({pid}) — metadata read FAILED "
-                        f"(403/404/429/None) — editorial access likely blocked")
-            results[name] = {"pid": pid, "meta": False, "tracks": 0}
-            continue
-        owner = (meta.get("owner") or {}).get("id")
-        fol   = (meta.get("followers") or {}).get("total")
-        tracks = fetch_playlist_tracks(pid)
-        results[name] = {"pid": pid, "meta": True, "owner": owner,
-                         "followers": fol, "tracks": len(tracks)}
-        if tracks:
-            ok += 1
-            log.info(f"EDITORIAL PROBE: ✓ {name} — owner={owner} "
-                     f"followers={fol:,} — read {len(tracks)} tracks "
-                     f"(e.g. '{tracks[0]['title']}' — {tracks[0]['artist']})")
-        else:
-            log.warning(f"EDITORIAL PROBE: {name} — metadata OK (owner={owner}) but "
-                        f"TRACKLIST read returned 0 — tracks likely restricted")
-
-    total = len(EDITORIAL_PROBE)
-    if ok == total:
-        status, verdict = "success", "READABLE — editorial-watchlist model is viable"
-    elif ok > 0:
-        status, verdict = "partial", f"PARTIAL — {ok}/{total} readable"
-    else:
-        status, verdict = "failed", f"BLOCKED — 0/{total} readable"
-    log.info(f"EDITORIAL PROBE VERDICT: {verdict}")
-    log.info("──────────────────────────────────────────────────────────")
-    _persist_probe(conn, status, {"verdict": verdict, "readable": ok,
-                                  "total": total, "token_source": "injected_user",
-                                  "results": results})
-
-
-def _persist_probe(conn, status: str, metadata: dict):
-    """Write the probe outcome to collector_runs so it's readable from the DB."""
-    if conn is None:
-        return
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO collector_runs (collector, status, completed_at, metadata)
-                VALUES ('editorial_probe', %s, NOW(), %s)
-            """, (status if status in ('success', 'partial', 'failed') else 'partial',
-                  psycopg2.extras.Json(metadata)))
-        conn.commit()
-    except Exception as e:
-        log.warning(f"EDITORIAL PROBE: could not persist verdict: {e}")
-        conn.rollback()
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run(user_token: Optional[str] = None, conn=None):
@@ -797,15 +711,13 @@ def run(user_token: Optional[str] = None, conn=None):
     When run standalone (python -m collectors.spotify_playlist_seeder):
       - Both default to None; connection and token acquired internally.
     """
-    # Inject user token so get_token() returns it immediately
+    # NOTE: user_token (the collector's Playwright web-player token) is no longer
+    # used for Web API calls — Spotify stopped honoring web-player tokens on
+    # api.spotify.com/v1. Track/search reads now go through the OAuth refresh-token
+    # flow in get_token(). The arg is kept for call-site compatibility.
     if user_token:
-        _token_cache["injected_token"] = user_token
-        _token_cache["access_token"]   = user_token
-        _token_cache["expires_at"]     = time.time() + 3600
-        _token_cache["source"]         = "injected_user"
-        log.info("Playlist seeder: using injected user token from Spotify collector")
-    else:
-        log.info("Playlist seeder: no injected token — will attempt sp_dc / client credentials")
+        log.info("Playlist seeder: web-player token ignored for Web API; "
+                 "using OAuth refresh-token flow")
 
     owns_conn = conn is None
     if owns_conn:
@@ -815,16 +727,13 @@ def run(user_token: Optional[str] = None, conn=None):
 
     ensure_tables(conn)
 
-    # Warn early if we probably can't read tracks
+    # Warn early if we can't read tracks
     if not _has_user_token():
         log.warning(
-            "No user-level token available. Playlist discovery will work but "
-            "track fetching will likely 403. To fix: ensure SPOTIFY_SP_DC is set "
-            "or the Spotify collector's Playwright session is providing a token."
+            "No OAuth user token available (SPOTIFY_REFRESH_TOKEN unset). Playlist "
+            "discovery/search will work but track reads will 403. Fix: run "
+            "scripts/spotify_oauth_setup.py and set SPOTIFY_REFRESH_TOKEN."
         )
-
-    # One-shot feasibility test for the editorial-watchlist crossover model.
-    probe_editorial_access(conn)
 
     # ── Build artist name filter set ─────────────────────────────────────────
     with conn.cursor() as cur:
